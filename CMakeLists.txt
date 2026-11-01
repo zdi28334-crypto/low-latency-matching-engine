@@ -14,6 +14,17 @@ if(ME_NATIVE)
 endif()
 add_compile_options(-Wall -Wextra -Wno-unused-parameter)
 
+# ME_SANITIZE=address  -> AddressSanitizer + UndefinedBehaviorSanitizer
+# ME_SANITIZE=thread   -> ThreadSanitizer (data races in the lock-free paths)
+set(ME_SANITIZE "" CACHE STRING "address | thread | empty")
+if(ME_SANITIZE STREQUAL "address")
+  add_compile_options(-fsanitize=address,undefined -fno-omit-frame-pointer -fno-sanitize-recover=all)
+  add_link_options(-fsanitize=address,undefined)
+elseif(ME_SANITIZE STREQUAL "thread")
+  add_compile_options(-fsanitize=thread -fno-omit-frame-pointer)
+  add_link_options(-fsanitize=thread)
+endif()
+
 find_package(Threads REQUIRED)
 include_directories(${CMAKE_SOURCE_DIR}/include)
 
@@ -33,6 +44,7 @@ target_link_libraries(factor_runner PRIVATE ${CMAKE_DL_LIBS})
 
 # ---------------------------------------------------------------- benches
 add_executable(bench_book bench/bench_book.cpp)
+target_link_libraries(bench_book PRIVATE me_core)
 add_executable(bench_engine bench/bench_engine.cpp)
 target_link_libraries(bench_engine PRIVATE me_core)
 
@@ -47,3 +59,11 @@ add_executable(unit_tests tests/test_main.cpp tests/test_book.cpp tests/test_eng
 target_link_libraries(unit_tests PRIVATE me_core)
 enable_testing()
 add_test(NAME unit_tests COMMAND unit_tests)
+
+# ---------------------------------------------------------------- fuzzing (clang only)
+option(ME_FUZZ "Build the libFuzzer target (requires clang)" OFF)
+if(ME_FUZZ)
+  add_executable(fuzz_book fuzz/fuzz_book.cpp)
+  target_compile_options(fuzz_book PRIVATE -fsanitize=fuzzer,address,undefined)
+  target_link_options(fuzz_book PRIVATE -fsanitize=fuzzer,address,undefined)
+endif()

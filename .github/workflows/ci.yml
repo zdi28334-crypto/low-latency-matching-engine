@@ -1,0 +1,62 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build-test:
+    name: build + checks (${{ matrix.cxx }})
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        cxx: [g++, clang++]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install numpy pandas
+      - name: Configure
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DME_NATIVE=OFF -DCMAKE_CXX_COMPILER=${{ matrix.cxx }}
+      - name: Build
+        run: cmake --build build -j"$(nproc)"
+      - name: Correctness pipeline
+        run: bash scripts/ci_check.sh build
+
+  sanitizers:
+    name: sanitizer (${{ matrix.san }})
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        san: [address, thread]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Allow TSan shadow mappings
+        if: matrix.san == 'thread'
+        run: sudo sysctl vm.mmap_rnd_bits=28
+      - name: Configure
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=RelWithDebInfo -DME_NATIVE=OFF -DME_SANITIZE=${{ matrix.san }}
+      - name: Build
+        run: cmake --build build -j"$(nproc)" --target unit_tests
+      - name: Unit tests under sanitizer
+        env:
+          TSAN_OPTIONS: halt_on_error=1
+          ASAN_OPTIONS: detect_leaks=1
+        run: ./build/unit_tests
+
+  fuzz:
+    name: libFuzzer (OrderBook vs RefBook, 60s)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y libclang-rt-18-dev
+      - name: Configure
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DME_NATIVE=OFF -DME_FUZZ=ON -DCMAKE_CXX_COMPILER=clang++
+      - name: Build
+        run: cmake --build build -j"$(nproc)" --target fuzz_book
+      - name: Fuzz
+        run: mkdir -p corpus && ./build/fuzz_book corpus -max_total_time=60 -max_len=4096
