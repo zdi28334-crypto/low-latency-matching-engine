@@ -2,10 +2,10 @@
 
 [![CI](https://github.com/zdi28334-crypto/low-latency-matching-engine/actions/workflows/ci.yml/badge.svg)](https://github.com/zdi28334-crypto/low-latency-matching-engine/actions/workflows/ci.yml)
 
-一个面向 A 股（上交所规则）的 C++20 低延迟撮合引擎，包含多线程分片撮合、集合竞价与连续竞价、Level-2 逐笔行情重建、延迟观测与优化、Python→C++ 因子插件化、回放对比与股指期货基差监控。所有指标都由本仓库代码在本机实测得到，`scripts/run_all.sh` 一条命令即可全部复现。
+一个面向 A 股（上交所 / 深交所规则）的 C++20 低延迟撮合引擎，包含多线程分片撮合、集合竞价与连续竞价、多种市价单与自成交防范、Level-2 逐笔行情重建、WAL + 快照崩溃恢复、延迟观测与优化、Python→C++ 因子插件化、回放对比与股指期货基差监控。所有指标都由本仓库代码在本机实测得到，`scripts/run_all.sh` 一条命令即可全部复现。
 
 ```
-./scripts/run_all.sh      # 编译 → 单测 → 基准 → L2 重建 → 回放对比 → 因子校验 → 基差监控
+./scripts/run_all.sh      # 编译 → 单测 → 基准 → L2 重建 → 回放对比 → 崩溃恢复 → 因子校验 → 基差监控
 ./scripts/ci_check.sh     # CI 用的快速正确性检查（不跑基准）
 ```
 
@@ -18,7 +18,9 @@
 | 模块 | 实现 | 关键文件 |
 |---|---|---|
 | 分片与多线程撮合 | 一致性 Hash 环（虚拟节点）把证券分到 shard；每个 shard 独占线程 + 独占 OrderBook，经 SPSC 无锁队列收单 | `consistent_hash.h` `spsc_queue.h` `engine.h/.cpp` |
-| 撮合规则与 L2 行情重建 | 价格-时间优先撮合、最优五档即时成交剩余撤销、上交所集合竞价定价规则、主板价格笼子；按上交所逐笔合并格式（A/D/T/S）输出行情并从行情重建盘口 | `order_book.h` `l2.h` `tools/exchange_sim.cpp` `tools/l2_rebuild.cpp` |
+| 撮合规则 | 价格-时间优先撮合；限价单与 4 种市价单（最优五档即时成交剩余撤销 / 剩余转限价、本方最优、对手方最优）；上交所 / 深交所集合竞价定价规则；主板价格笼子；三种自成交防范策略 | `types.h` `order_book.h` |
+| L2 行情重建 | 按上交所（A/D/T/S）或深交所（O/T/C/S）逐笔口径输出行情，并只凭行情重建盘口 | `l2.h` `tools/exchange_sim.cpp` `tools/l2_rebuild.cpp` |
+| 崩溃恢复 | 带 CRC 的预写日志 + 原子快照；恢复后从断点续跑；用 `kill -9` 做真实崩溃测试 | `recovery.h/.cpp` `tools/crash_test.cpp` |
 | 低延迟与延迟观测 | mmap 异步日志（热路径只拷贝 40 字节记录）；rdtscp 计时 + 对数直方图记录 queue_wait / match_core / publish / e2e 四段延迟；同步日志 vs 异步日志 A/B 对比 | `async_logger.h/.cpp` `latency.h` `bench/bench_engine.cpp` |
 | 因子插件化 | 4 个因子族 `.so`（C ABI + dlopen 加载），O(n) 滚动窗口算法，160 个因子与 Python 逐值比对 | `include/factor/factor_api.h` `plugins/*.cpp` `tools/factor_runner.cpp` `python/factors_ref.py` `python/compare_factors.py` |
 | 回放验证与基差监控 | 优化版与朴素版撮合差分回放 + golden 文件回归 + 模糊测试对拍；IF/IC 秒级年化基差监控 + 企业微信告警 | `ref_book.h` `tools/replay_diff.cpp` `fuzz/` `python/basis_monitor.py` |
@@ -60,8 +62,60 @@
 
 比较全部用整数完成（`p*100 <= base*102`），避免浮点误差导致边界价被误判。参考实现 RefBook 故意改用浮点写法，与之独立对拍。另一种处理方式是把超出笼子的申报暂存、等笼子移动后再参与撮合，本项目未实现。上线前应以交易所最新发布的规则原文为准。
 
-### Level-2 逐笔语义（`include/me/l2.h`）
-按上交所逐笔合并行情的口径输出 A（挂单）、D（撤单）、T（成交）、S（状态）四类记录。重建时有一个容易踩的坑：**上交所只在订单“挂上簿”时才发布 A，且数量是剩余量**。一笔到达即全部成交的主动单从来不会有 A；部分成交的则先出 T，再出剩余量的 A。所以重建器处理 T 时只扣减簿上真实存在的一方，主动方查不到是正常现象。本次运行中有 843,535 笔成交属于这种情况，异常计数为 0。
+### 市价单类型（`OrdType`）
+市价单只在连续竞价阶段接受，集合竞价阶段一律拒单。
+| 类型 | 行为 |
+|---|---|
+| 最优五档即时成交剩余撤销 | 最多扫对手方 5 个价位，剩余部分撤销 |
+| 最优五档即时成交剩余转限价 | 最多扫 5 个价位，剩余部分以最后一笔成交价转为限价单挂出；对手方为空时拒单 |
+| 本方最优 | 以本方最优价作为限价挂出；本方为空时拒单 |
+| 对手方最优 | 以对手方最优价作为限价，只吃这一个价位，剩余部分在该价挂出；对手方为空时拒单 |
+
+### 自成交防范（`StpPolicy`）
+同一账户（账户号非 0）的新订单在连续竞价中碰到自己的挂单时，按配置处理：
+- `CancelNewest`：停止撮合，撤销新订单的剩余部分；
+- `CancelOldest`：撤销那笔挂单，继续往后撮合；
+- `CancelBoth`：两边都撤；
+- `None`：允许自成交（默认）。
+
+集合竞价阶段不做自成交检查。撤掉的挂单会通过 `on_cancel` 发出（行情里表现为撤单）。新订单被丢弃的剩余部分走单独的 `on_expire` 回调，并注明原因是 IOC 还是自成交。
+
+### 上交所 / 深交所差异（`Venue`）
+**集合竞价定价。** 两个交易所的前三条规则相同，"未成交量最小"之后仍然并列时，处理方式不同：
+- 上交所：取剩余候选价的中间价；
+- 深交所：开盘集合竞价取最接近前收盘价的价格，其他集合竞价取最接近最近成交价的价格（距离相同时取较低价，这一点为实现约定）。
+
+单测 `szse_auction_closest_to_reference` 构造了同一组订单：上交所定价 10.01，深交所定价 9.97。
+
+**逐笔行情口径**（`include/me/l2.h`）
+| | 上交所 | 深交所 |
+|---|---|---|
+| 委托何时发布 | 挂上簿后才发布 A，数量是剩余量；到达即全部成交的主动单没有 A | 收到即发布 O，数量是原始量，先于它引起的成交 |
+| 撤单 | 委托流里的 D | 成交流里的 C（对应 ExecType=4） |
+| 市价单 | 不出现在委托流里 | 出现在委托流里，价格为 0 |
+| 重建要点 | 成交里的主动方可能从未上簿，只扣减簿上真实存在的一方 | 收到即入簿，盘口会短暂交叉，直到随后的成交记录到达；剩余转限价的挂单价要从它最后一笔成交价推断 |
+
+本次运行中，上交所口径有 815,162 笔成交的主动方从未上簿；深交所口径这个数是 0。两种口径重建出的盘口都与撮合引擎逐档一致，异常计数为 0。实现上做了一处简化：深交所的本方最优 / 对手方最优订单直接以转换后的价格发布。
+
+### 崩溃恢复（`include/me/recovery.h`）
+`DurableMatcher` 采用经典的 WAL + 快照方案：
+1. 每条消息分配序号，**先写 WAL 再撮合**。WAL 写进 mmap 文件，进程崩溃后数据立即可见；要防断电，可以开启 `fsync`，在每次快照时 msync。
+2. 每隔 N 条消息，把所有订单簿完整写入 `snapshot.tmp`（每笔挂单按 FIFO 顺序，加上交易阶段和最新价）。写完 fsync，再原子 rename 成 `snapshot.bin`，然后开新的 WAL 段 `wal-<seq>.log`，删掉旧段。
+3. 恢复时先加载快照（序号 S），再从 S+1 开始重放 `wal-S.log`。每条 WAL 记录都带魔数和 CRC32，崩溃时写了一半的记录会因校验失败而被丢弃，重放到此为止。
+
+撮合是确定性的，重放同样的消息必然得到同样的盘口。恢复完成后立刻做一次快照，上游网关从 `last_seq + 1` 开始重发。
+
+| 崩溃时机 | 为什么安全 |
+|---|---|
+| 正在追加 WAL 记录 | 写了一半的记录 CRC 校验失败，被丢弃 |
+| 正在写 snapshot.tmp | 旧的 snapshot.bin 和对应 WAL 段都还完整 |
+| rename 之后、新 WAL 创建之前 | 快照已覆盖所有已接收的消息 |
+| 旧 WAL 段删除之前 | 恢复只读和快照序号对应的那一段 |
+
+`crash_test` 会 fork 子进程跑完整的订单流，在随机时刻 `kill -9`（不调析构、不刷缓冲），然后检查两件事：恢复出的盘口与"只处理前 last_seq 条消息"的参考结果完全一致，包括每笔挂单和 FIFO 顺序；续跑完剩余消息后，最终盘口与不中断跑完的结果一致。有几次恰好在写快照的过程中被杀，恢复程序正确地退回到上一份快照，并重放了完整的 WAL 段。
+
+### Level-2 逐笔重建的验证
+上交所口径下，到达即全部成交的主动单从来没有 A 记录，所以重建器处理成交时只扣减簿上真实存在的一方。最终用撮合引擎的真实盘口逐档对账。
 
 ### 延迟测量本身也要低开销（`include/me/latency.h`）
 - **TSC 计时**：启动时检查 CPU 是否支持不变 TSC（`constant_tsc` + `nonstop_tsc`），支持则用 `rdtscp` 读时间戳计数器，并用 steady_clock 校准换算系数；不支持则自动退回 steady_clock。实测每次取时间 15 ns，steady_clock 为 21 ns。网关线程和 shard 线程在不同核上打点，跨核差值偶尔因微小偏差为负，这里统一截断为 0。
@@ -83,17 +137,19 @@
 ### 3.1 正确性（全部通过）
 | 检查 | 结果 |
 |---|---|
-| 单元测试 | 17/17 通过 |
-| 差分回放：优化版 OrderBook vs 朴素 std::map 版 RefBook | 905,577 笔成交逐笔一致（含 62,042 笔集合竞价成交） |
-| 随机对拍（单测内） | 30,000 条随机构造的极端订单流（价格密集交叉、撤已死单、乱序切换阶段、触发价格笼子），全部一致 |
-| libFuzzer 覆盖率引导模糊测试（开启 ASan + UBSan） | 120 秒内执行 807,651 次，0 不一致、0 内存错误 |
+| 单元测试 | 26/26 通过 |
+| 差分回放：优化版 OrderBook vs 朴素 std::map 版 RefBook | 完整交易日 876,551 笔成交逐笔一致（含 61,389 笔集合竞价成交） |
+| 全配置差分（上交所 / 深交所 × 4 种自成交策略） | 8 种配置下共 233,588 笔成交一致，挂单及其 FIFO 顺序完全一致 |
+| 随机对拍（单测内） | 30,000 条随机构造的极端订单流（价格密集交叉、撤已死单、乱序切换阶段、价格笼子、5 种订单类型、自成交、中途快照恢复），全部一致 |
+| libFuzzer 覆盖率引导模糊测试（开启 ASan + UBSan） | 120 秒内执行 699,113 次，0 不一致、0 内存错误；每次都同时校验成交、挂单顺序、逐笔行情重建 |
 | ThreadSanitizer / AddressSanitizer + UBSan 跑全部单测 | 0 报告 |
 | golden 回归：本次构建 vs 已录制成交文件 | 一致 |
 | 多线程分片引擎 vs 单线程 | 40 只证券的最终盘口逐档一致 |
-| L2 重建盘口 vs 撮合引擎真实盘口 | 9,359 个价位全部一致；0 缺失 / 0 多余 / 0 数量不符 |
+| L2 重建盘口 vs 撮合引擎真实盘口 | 上交所口径 9,133 个价位、深交所口径 9,134 个价位全部一致；0 缺失 / 0 多余 / 0 数量不符 |
+| 崩溃恢复（随机时刻 `kill -9`） | 10/10 次恢复后盘口与参考结果完全一致，续跑后最终盘口也一致；WAL 尾部截断、中间位翻转、半写快照三种损坏场景单测通过 |
 | C++ 因子 vs Python 参考 | 160/160 通过，最大相对误差 8.2e-14（容差 1e-9） |
 
-模糊测试除了比对成交和盘口，还会检查一条不变量：连续竞价阶段买一价必须低于卖一价。这条可以证明集合竞价撮合结束后盘口不会处于交叉状态。
+模糊测试除了比对成交和盘口，还会检查一条不变量：连续竞价阶段买一价必须低于卖一价。这条可以证明集合竞价撮合结束后、以及各种市价单转限价之后，盘口都不会处于交叉状态。
 
 ### 3.2 撮合核心（单线程）
 | 实现 | 吞吐 | 每条消息 |
@@ -124,7 +180,8 @@
 
 ### 3.5 其他
 - 因子：160 个因子 × 45,000 行，C++ 0.055 s，比 Python（numpy 向量化）的 1.5–1.8 s 快约 30 倍，比优化前的 C++ 朴素实现快约 10 倍。
-- L2 重建：222 万条逐笔记录，约 0.9 M 条/s，单线程且含 CSV 解析。
+- L2 重建：222 万（上交所口径）/ 265 万（深交所口径）条逐笔记录，约 0.9 M 条/s，单线程且含 CSV 解析。
+- 崩溃恢复：带 WAL 和每 10 万条一次快照的持久化撮合约 1.8–1.9 M msg/s；200 万条消息规模下，一次恢复（加载快照 + 重放最多 10 万条 WAL）耗时 50–160 ms。
 - 基差监控：14,400 秒 × 2 个合约，两段注入的异常都被捕获，在正常区间内没有误报，异常结束后各发一条恢复消息。
 
 ---
@@ -132,9 +189,9 @@
 ## 4. 工程质量与 CI
 
 每次 push 都会在 GitHub Actions 上运行 `.github/workflows/ci.yml`，包含：
-- **build-test**：g++ 和 clang++ 各编译一遍，跑 `scripts/ci_check.sh`（单测、L2 重建对账、差分回放、golden 回归、因子一致性、基差监控）。
+- **build-test**：g++ 和 clang++ 各编译一遍，跑 `scripts/ci_check.sh`（单测、两种口径的 L2 重建对账、差分回放、golden 回归、`kill -9` 崩溃恢复、因子一致性、基差监控）。
 - **sanitizers**：分别在 AddressSanitizer + UBSan 和 ThreadSanitizer 下跑全部单测。TSan 专门用来检查 SPSC 队列、异步日志这些无锁路径有没有数据竞争。
-- **fuzz**：libFuzzer 跑 60 秒，对拍 OrderBook 和 RefBook。
+- **fuzz**：libFuzzer 跑 60 秒，对拍 OrderBook 和 RefBook，覆盖两个交易所、全部订单类型、自成交策略、逐笔行情重建和中途快照恢复。
 
 本地复现：
 ```
@@ -149,13 +206,13 @@ CXX=clang++ cmake -S . -B build-fuzz -DME_FUZZ=ON && cmake --build build-fuzz --
 
 ```
 include/me/      types / flat_map / order_book / ref_book / spsc_queue / consistent_hash
-                 latency / async_logger / engine / flow / l2
+                 latency / async_logger / engine / flow / l2 / recovery
 include/factor/  factor_api.h（插件 C ABI）
-src/             engine.cpp / async_logger.cpp
+src/             engine.cpp / async_logger.cpp / recovery.cpp
 plugins/         momentum / volatility / volume / reversion（各编成 .so）
-tools/           gen_flow / exchange_sim / l2_rebuild / replay_diff / factor_runner / hiccup
+tools/           gen_flow / exchange_sim / l2_rebuild / replay_diff / crash_test / factor_runner / hiccup
 bench/           bench_book（核心吞吐）/ bench_engine（多线程 + 阶段延迟）
-tests/           17 个单测（无第三方依赖）
+tests/           26 个单测（无第三方依赖）
 fuzz/            libFuzzer 目标 + 共用的对拍驱动
 python/          factors_ref / compare_factors / gen_bars / basis_monitor / gen_basis_data
 scripts/         run_all.sh（全量）/ ci_check.sh（CI 快检）
@@ -165,10 +222,11 @@ scripts/         run_all.sh（全量）/ ci_check.sh（CI 快检）
 ### 工具用法速查
 ```
 build/gen_flow data/day.flow 100 2000000 42
-build/exchange_sim data/day.flow data/ticks.csv data/engine_snapshot.csv
-build/l2_rebuild data/ticks.csv --expect data/engine_snapshot.csv --watch 0 --l5 data/l5_sym0.csv
+build/exchange_sim data/day.flow data/ticks.csv data/snap.csv --venue sse|szse --stp none|newest|oldest|both
+build/l2_rebuild data/ticks.csv --venue sse|szse --expect data/snap.csv --watch 0 --l5 data/l5_sym0.csv
 build/replay_diff data/day.flow --record data/golden.trades     # 录制
 build/replay_diff data/day.flow --golden data/golden.trades     # 回归
+build/crash_test 10 50 2000000 100000                            # 次数 / 证券数 / 消息数 / 快照间隔
 build/bench_engine --shards 2 --log async|sync|none --rate 100000 --pin 1
 WECOM_WEBHOOK=https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=xxx python3 python/basis_monitor.py data.csv
 ```
@@ -176,7 +234,9 @@ WECOM_WEBHOOK=https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=xxx python3 p
 ## 6. 已知简化 / 可扩展方向
 - 数据是合成的。真实上交所 L2 逐笔是付费数据，`l2_rebuild` 的输入是一个明确定义的 CSV 格式，接真实数据只需要写一个字段映射。
 - 价格笼子只实现了“超出即拒单”，未实现“暂存后再撮合”的方式。
-- 未实现：申报数量整手校验、本方最优 / 对手方最优等其他市价单类型、自成交防范、盘中证券迁移、崩溃恢复（WAL + 快照）、深交所逐笔口径。
+- 深交所模式只覆盖了集合竞价定价和逐笔口径两处差异；本方最优 / 对手方最优在深交所行情里简化为按转换后价格发布。
+- 崩溃恢复目前接在单线程的 `DurableMatcher` 上。在多线程分片引擎里，网关可以充当定序器统一写 WAL，但各 shard 的一致性快照需要先让 shard 停顿（或按 shard 各自记录序号），这部分还没有实现。
+- 未实现：申报数量整手校验、自成交检查扩展到集合竞价、盘中证券迁移。
 - L2 重建用的是 std::map 加 CSV 解析，约 0.9 M 条/s。改用数组档位和二进制格式可以明显提速。
 - 基差监控的到期日按“合约月第三个周五”计算，未接节假日日历。
 - 只有 2 vCPU，无法展示多 shard 的线性扩展；在更多核的机器上用 `--shards N --pin 1` 测试即可。

@@ -24,14 +24,19 @@ echo; echo "==> [3] latency at a fixed offered load of 100K msg/s"
 echo; echo "==> platform jitter (idle pinned CPU, 5s)"
 ./build/hiccup 1
 
-echo; echo "==> [4] L2 feed -> rebuild -> snapshot check"
+echo; echo "==> [4] L2 feed -> rebuild -> snapshot check (SSE and SZSE styles)"
 ./build/gen_flow data/day.flow 100 2000000 42
-./build/exchange_sim data/day.flow data/ticks.csv data/engine_snapshot.csv
-./build/l2_rebuild data/ticks.csv --expect data/engine_snapshot.csv --watch 0 --l5 data/l5_sym0.csv
+./build/exchange_sim data/day.flow data/ticks.csv data/engine_snapshot.csv --venue sse
+./build/l2_rebuild data/ticks.csv --venue sse --expect data/engine_snapshot.csv --watch 0 --l5 data/l5_sym0.csv
+./build/exchange_sim data/day.flow data/ticks_szse.csv data/engine_snapshot_szse.csv --venue szse --stp oldest
+./build/l2_rebuild data/ticks_szse.csv --venue szse --expect data/engine_snapshot_szse.csv
 
 echo; echo "==> [5] replay + differential + golden regression"
 ./build/replay_diff data/day.flow --record data/golden.trades
 ./build/replay_diff data/day.flow --golden data/golden.trades
+
+echo; echo "==> [5b] crash recovery: SIGKILL at random moments, recover, compare, resume"
+./build/crash_test 10 50 2000000 100000
 
 echo; echo "==> [6] Python -> C++ factor plugins consistency"
 python3 python/gen_bars.py data/bars.csv 30 1500 1

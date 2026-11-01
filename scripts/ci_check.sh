@@ -10,14 +10,20 @@ trap 'rm -rf "$D"' EXIT
 echo "==> unit tests"
 "$B"/unit_tests
 
-echo "==> L2 feed -> rebuild -> snapshot check"
+echo "==> L2 feed -> rebuild -> snapshot check (SSE and SZSE styles)"
 "$B"/gen_flow "$D"/day.flow 30 300000 7
-"$B"/exchange_sim "$D"/day.flow "$D"/ticks.csv "$D"/snap.csv
-"$B"/l2_rebuild "$D"/ticks.csv --expect "$D"/snap.csv
+"$B"/exchange_sim "$D"/day.flow "$D"/ticks.csv "$D"/snap.csv --venue sse --stp oldest
+"$B"/l2_rebuild "$D"/ticks.csv --venue sse --expect "$D"/snap.csv
+"$B"/exchange_sim "$D"/day.flow "$D"/ticks_sz.csv "$D"/snap_sz.csv --venue szse --stp both
+"$B"/l2_rebuild "$D"/ticks_sz.csv --venue szse --expect "$D"/snap_sz.csv
 
 echo "==> differential replay + golden round-trip"
 "$B"/replay_diff "$D"/day.flow --record "$D"/golden.trades
 "$B"/replay_diff "$D"/day.flow --golden "$D"/golden.trades
+"$B"/replay_diff "$D"/day.flow --venue szse --stp newest
+
+echo "==> crash recovery (SIGKILL at random moments)"
+"$B"/crash_test 4 20 400000 50000
 
 echo "==> Python -> C++ factor consistency"
 python3 python/gen_bars.py "$D"/bars.csv 10 800 3
