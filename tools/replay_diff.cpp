@@ -1,5 +1,6 @@
 // Replay & result-comparison harness for matching logic / performance work.
 //   replay_diff <in.flow> [--record golden.trades] [--golden golden.trades]
+//               [--venue sse|szse] [--stp none|newest|oldest|both]
 // 1. replays the flow through the optimised OrderBook and the naive RefBook
 //    and requires identical trade streams (differential test);
 // 2. --record writes the trade stream as a golden file; --golden compares
@@ -21,6 +22,7 @@ struct Collect {
     void on_trade(const Trade& t) { out->push_back(t); }
     void on_rest(OrderId, Side, Price, Qty, uint32_t) {}
     void on_cancel(OrderId, Side, Price, Qty, uint32_t) {}
+    void on_expire(OrderId, Side, Qty, ExpireReason, uint32_t) {}
     void on_reject(OrderId, RejectReason) {}
     void on_phase(Phase, uint32_t) {}
 };
@@ -37,9 +39,15 @@ static uint64_t digest(const std::vector<Trade>& v) {
 int main(int argc, char** argv) {
     if (argc < 2) { std::fprintf(stderr, "usage: replay_diff in.flow [--record f] [--golden f]\n"); return 1; }
     std::string record, golden;
+    BookConfig cfg;
     for (int i = 2; i + 1 < argc; i += 2) {
-        if (!std::strcmp(argv[i], "--record")) record = argv[i + 1];
-        else if (!std::strcmp(argv[i], "--golden")) golden = argv[i + 1];
+        std::string k = argv[i], v = argv[i + 1];
+        if (k == "--record") record = v;
+        else if (k == "--golden") golden = v;
+        else if (k == "--venue") cfg.venue = v == "szse" ? Venue::SZSE : Venue::SSE;
+        else if (k == "--stp") cfg.stp = v == "newest" ? StpPolicy::CancelNewest
+                                       : v == "oldest" ? StpPolicy::CancelOldest
+                                       : v == "both"   ? StpPolicy::CancelBoth : StpPolicy::None;
     }
     Flow f = load_flow(argv[1]);
     const size_t ns = f.symbols.size();
@@ -49,13 +57,13 @@ int main(int argc, char** argv) {
     std::vector<std::vector<Trade>> fast_tr(ns), ref_tr(ns);
     std::vector<OrderBook> fast;
     std::vector<Collect> col(ns);
-    for (size_t i = 0; i < ns; ++i) { fast.emplace_back(f.symbols[i], 1 << 14); col[i].out = &fast_tr[i]; }
+    for (size_t i = 0; i < ns; ++i) { fast.emplace_back(f.symbols[i], 1 << 14, cfg); col[i].out = &fast_tr[i]; }
     int64_t t0 = now_ns();
     for (const OrderMsg& m : f.msgs) fast[m.sym].process(m, col[m.sym]);
     double t_fast = (now_ns() - t0) / 1e9;
 
     std::vector<RefBook> ref;
-    for (auto& s : f.symbols) ref.emplace_back(s);
+    for (auto& s : f.symbols) ref.emplace_back(s, cfg);
     t0 = now_ns();
     for (const OrderMsg& m : f.msgs) ref[m.sym].process(m);
     double t_ref = (now_ns() - t0) / 1e9;

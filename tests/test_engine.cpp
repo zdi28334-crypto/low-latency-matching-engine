@@ -51,6 +51,7 @@ TEST(engine_sharded_equals_single_thread) {
         void on_trade(const Trade&) { ++trades; }
         void on_rest(OrderId, Side, Price, Qty, uint32_t) {}
         void on_cancel(OrderId, Side, Price, Qty, uint32_t) {}
+        void on_expire(OrderId, Side, Qty, ExpireReason, uint32_t) {}
         void on_reject(OrderId, RejectReason) {}
         void on_phase(Phase, uint32_t) {}
     } nl;
@@ -72,7 +73,7 @@ TEST(engine_sharded_equals_single_thread) {
     for (int k = 0; k < eng.shards(); ++k) {
         const ShardStats& s = eng.stats(k);
         trades += s.trades; msgs += s.msgs;
-        logged_expected += s.trades + s.rests + s.cancels + s.rejects;
+        logged_expected += s.trades + s.rests + s.cancels + s.expires + s.rejects;
     }
     CHECK_EQ(msgs, f.msgs.size());
     CHECK_EQ(trades, nl.trades);

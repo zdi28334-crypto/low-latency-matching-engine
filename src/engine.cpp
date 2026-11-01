@@ -49,6 +49,9 @@ struct EventBuffer {
     void on_cancel(OrderId id, Side s, Price p, Qty q, uint32_t) {
         ++st->cancels; push('D', s == Side::Buy ? 'B' : 'S', id, 0, p, q);
     }
+    void on_expire(OrderId id, Side s, Qty q, ExpireReason r, uint32_t) {
+        ++st->expires; push('X', s == Side::Buy ? 'B' : 'S', id, uint64_t(r), 0, q);
+    }
     void on_reject(OrderId id, RejectReason r) { ++st->rejects; push('R', 0, id, uint64_t(r), 0, 0); }
     void on_phase(Phase, uint32_t) {}
 };
@@ -64,7 +67,7 @@ Engine::Engine(const std::vector<SymbolInfo>& symbols, EngineOptions opt) : opt_
         int k = ring.shard_of(s.code);
         route_[s.id] = k;
         local_index_[s.id] = static_cast<int>(shards_[k]->books.size());
-        shards_[k]->books.emplace_back(s, 1 << 14);
+        shards_[k]->books.emplace_back(s, 1 << 14, opt_.book);
     }
     (void)TscClock::now();  // calibrate before any thread starts
     if (opt_.log_mode == LogMode::Async) {

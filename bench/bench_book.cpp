@@ -14,6 +14,7 @@ struct Count {
     void on_trade(const Trade&) { ++trades; }
     void on_rest(OrderId, Side, Price, Qty, uint32_t) {}
     void on_cancel(OrderId, Side, Price, Qty, uint32_t) {}
+    void on_expire(OrderId, Side, Qty, ExpireReason, uint32_t) {}
     void on_reject(OrderId, RejectReason) {}
     void on_phase(Phase, uint32_t) {}
 };

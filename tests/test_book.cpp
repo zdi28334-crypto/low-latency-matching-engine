@@ -16,22 +16,28 @@ namespace {
 
 struct Rec {
     std::vector<Trade> trades;
-    std::vector<std::pair<OrderId, Qty>> rests, cancels;
+    std::vector<std::pair<OrderId, Qty>> rests, cancels, expires;
+    std::vector<Price> rest_px;
+    std::vector<ExpireReason> expire_why;
     std::vector<RejectReason> rejects;
     void on_trade(const Trade& t) { trades.push_back(t); }
-    void on_rest(OrderId id, Side, Price, Qty q, uint32_t) { rests.push_back({id, q}); }
+    void on_rest(OrderId id, Side, Price p, Qty q, uint32_t) { rests.push_back({id, q}); rest_px.push_back(p); }
     void on_cancel(OrderId id, Side, Price, Qty q, uint32_t) { cancels.push_back({id, q}); }
+    void on_expire(OrderId id, Side, Qty q, ExpireReason why, uint32_t) {
+        expires.push_back({id, q});
+        expire_why.push_back(why);
+    }
     void on_reject(OrderId, RejectReason r) { rejects.push_back(r); }
     void on_phase(Phase, uint32_t) {}
 };
 
 SymbolInfo sym10() { return make_symbol(0, 1000); }  // prev close 10.00, band 9.00-11.00
 
-OrderMsg lim(OrderId id, Side s, Price p, Qty q) {
-    OrderMsg m; m.id = id; m.side = s; m.price = p; m.qty = q; return m;
+OrderMsg lim(OrderId id, Side s, Price p, Qty q, AccountId acct = 0) {
+    OrderMsg m; m.id = id; m.side = s; m.price = p; m.qty = q; m.account = acct; return m;
 }
-OrderMsg mkt(OrderId id, Side s, Qty q) {
-    OrderMsg m; m.id = id; m.side = s; m.qty = q; m.ord_type = OrdType::MarketBest5IOC; return m;
+OrderMsg mkt(OrderId id, Side s, Qty q, OrdType t = OrdType::MarketBest5IOC, AccountId acct = 0) {
+    OrderMsg m; m.id = id; m.side = s; m.qty = q; m.ord_type = t; m.account = acct; return m;
 }
 OrderMsg cxl(OrderId id) { OrderMsg m; m.type = MsgType::Cancel; m.id = id; return m; }
 OrderMsg phase(Phase p) { OrderMsg m; m.type = MsgType::Phase; m.phase = p; return m; }
@@ -197,6 +203,168 @@ TEST(price_cage_ten_tick_floor_and_fallbacks) {
     CHECK_EQ(b.last_price(), 220);
 }
 
+// ---------------------------------------------------------- self-trade prevention
+// Book: sell #1 (acct 8) @10.00, sell #2 (acct 7) @10.00, sell #3 (acct 8) @10.01.
+// Incoming: buy 300 @10.01 from acct 7, which meets its own order #2.
+static void stp_setup(OrderBook& b, Rec& r) {
+    b.process(phase(Phase::Continuous), r);
+    b.process(lim(1, Side::Sell, 1000, 100, 8), r);
+    b.process(lim(2, Side::Sell, 1000, 100, 7), r);
+    b.process(lim(3, Side::Sell, 1001, 100, 8), r);
+    b.process(lim(9, Side::Buy, 1001, 300, 7), r);
+}
+
+TEST(stp_cancel_newest) {
+    BookConfig cfg; cfg.stp = StpPolicy::CancelNewest;
+    OrderBook b(sym10(), 64, cfg); Rec r;
+    stp_setup(b, r);
+    CHECK_EQ(r.trades.size(), 1u);                 // only #1
+    CHECK_EQ(r.expires.size(), 1u);
+    CHECK_EQ(r.expires[0].second, 200);            // remainder of #9 dropped
+    CHECK(r.expire_why[0] == ExpireReason::SelfTrade);
+    CHECK_EQ(b.level_qty(Side::Sell, 1000), 100);  // #2 untouched
+    CHECK_EQ(b.level_qty(Side::Sell, 1001), 100);  // #3 untouched
+    CHECK(!b.has_bid());
+}
+
+TEST(stp_cancel_oldest) {
+    BookConfig cfg; cfg.stp = StpPolicy::CancelOldest;
+    OrderBook b(sym10(), 64, cfg); Rec r;
+    stp_setup(b, r);
+    CHECK_EQ(r.trades.size(), 2u);                 // #1, then #3 after skipping #2
+    CHECK_EQ(r.trades[1].sell_id, 3u);
+    CHECK_EQ(r.cancels.size(), 1u);
+    CHECK_EQ(r.cancels[0].first, 2u);              // resting own order cancelled
+    CHECK_EQ(b.best_bid(), 1001);                  // remainder 100 rests
+    CHECK_EQ(b.level_qty(Side::Buy, 1001), 100);
+    CHECK(!b.has_ask());
+}
+
+TEST(stp_cancel_both_and_disabled) {
+    BookConfig cfg; cfg.stp = StpPolicy::CancelBoth;
+    OrderBook b(sym10(), 64, cfg); Rec r;
+    stp_setup(b, r);
+    CHECK_EQ(r.trades.size(), 1u);
+    CHECK_EQ(r.cancels.size(), 1u);
+    CHECK_EQ(r.expires.size(), 1u);
+    CHECK_EQ(b.level_qty(Side::Sell, 1000), 0);
+    CHECK_EQ(b.level_qty(Side::Sell, 1001), 100);
+
+    OrderBook b2(sym10()); Rec r2;                 // default: no STP
+    stp_setup(b2, r2);
+    CHECK_EQ(r2.trades.size(), 3u);
+    CHECK_EQ(r2.trades[1].sell_id, 2u);            // self-trade allowed
+
+    BookConfig c3; c3.stp = StpPolicy::CancelNewest;
+    OrderBook b3(sym10(), 64, c3); Rec r3;         // account 0 is never checked
+    b3.process(phase(Phase::Continuous), r3);
+    b3.process(lim(1, Side::Sell, 1000, 100, 0), r3);
+    b3.process(lim(2, Side::Buy, 1000, 100, 0), r3);
+    CHECK_EQ(r3.trades.size(), 1u);
+}
+
+// ---------------------------------------------------------- market order types
+TEST(market_best5_to_limit) {
+    OrderBook b(sym10()); Rec r;
+    b.process(phase(Phase::Continuous), r);
+    b.process(mkt(1, Side::Buy, 100, OrdType::MarketBest5ToLimit), r);  // empty book
+    CHECK(r.rejects.back() == RejectReason::NoCounterparty);
+    b.process(lim(2, Side::Sell, 1000, 100), r);
+    b.process(lim(3, Side::Sell, 1001, 100), r);
+    b.process(mkt(4, Side::Buy, 300, OrdType::MarketBest5ToLimit), r);
+    CHECK_EQ(r.trades.size(), 2u);
+    CHECK_EQ(r.rests.back().first, 4u);
+    CHECK_EQ(r.rests.back().second, 100);
+    CHECK_EQ(r.rest_px.back(), 1001);              // remainder rests at the last fill price
+    CHECK_EQ(b.best_bid(), 1001);
+}
+
+TEST(own_best_and_counter_best) {
+    OrderBook b(sym10()); Rec r;
+    b.process(phase(Phase::Continuous), r);
+    b.process(mkt(1, Side::Buy, 100, OrdType::OwnBest), r);      // no own bid
+    b.process(mkt(2, Side::Buy, 100, OrdType::CounterBest), r);  // no ask
+    CHECK_EQ(r.rejects.size(), 2u);
+    CHECK(r.rejects[0] == RejectReason::NoCounterparty);
+    b.process(lim(3, Side::Buy, 995, 100), r);
+    b.process(mkt(4, Side::Buy, 200, OrdType::OwnBest), r);      // joins the best bid
+    CHECK_EQ(r.rest_px.back(), 995);
+    CHECK_EQ(b.level_qty(Side::Buy, 995), 300);
+    b.process(lim(5, Side::Sell, 1000, 100), r);
+    b.process(lim(6, Side::Sell, 1002, 100), r);
+    b.process(mkt(7, Side::Buy, 300, OrdType::CounterBest), r);  // limit at best ask 10.00
+    CHECK_EQ(r.trades.size(), 1u);
+    CHECK_EQ(r.trades[0].price, 1000);
+    CHECK_EQ(r.rest_px.back(), 1000);                            // remainder rests at 10.00
+    CHECK_EQ(b.level_qty(Side::Buy, 1000), 200);
+    CHECK_EQ(b.level_qty(Side::Sell, 1002), 100);                // 10.02 not touched
+    b.process(mkt(8, Side::Sell, 600, OrdType::MarketBest5IOC), r);  // bids hold 500
+    CHECK_EQ(r.expires.size(), 1u);
+    CHECK(!r.expire_why.empty() && r.expire_why.back() == ExpireReason::IOC);
+    CHECK(!r.expires.empty() && r.expires.back().second == 100);
+}
+
+// ---------------------------------------------------------- SZSE auction tie-break
+TEST(szse_auction_closest_to_reference) {
+    BookConfig sz; sz.venue = Venue::SZSE;
+    // Opening auction: 9.97 and 10.04 tie on volume and imbalance.
+    // SSE takes the midpoint (10.01); SZSE takes the one closest to the
+    // previous close 10.00, i.e. 9.97.
+    for (Venue v : {Venue::SSE, Venue::SZSE}) {
+        BookConfig c; c.venue = v;
+        OrderBook b(sym10(), 64, c); Rec r;
+        b.process(phase(Phase::OpeningAuction), r);
+        b.process(lim(1, Side::Buy, 1004, 500), r);
+        b.process(lim(2, Side::Sell, 997, 500), r);
+        CHECK_EQ(b.auction_price().price, v == Venue::SSE ? 1001 : 997);
+    }
+    // Closing auction: reference is the last trade price (10.03 here), so
+    // between 10.00 and 10.04 SZSE picks 10.04.
+    OrderBook b(sym10(), 64, sz); Rec r;
+    b.process(phase(Phase::Continuous), r);
+    b.process(lim(1, Side::Sell, 1003, 100), r);
+    b.process(lim(2, Side::Buy, 1003, 100), r);
+    CHECK_EQ(b.last_price(), 1003);
+    b.process(phase(Phase::ClosingAuction), r);
+    b.process(lim(3, Side::Buy, 1004, 500), r);
+    b.process(lim(4, Side::Sell, 1000, 500), r);
+    AuctionResult ar = b.auction_price();
+    CHECK_EQ(ar.price, 1004);
+    b.process(phase(Phase::Closed), r);
+    CHECK_EQ(r.trades.back().price, 1004);
+    CHECK_EQ(b.last_price(), 1004);
+}
+
+// Snapshot / restore reproduces the exact book including FIFO order.
+TEST(snapshot_restore_roundtrip) {
+    Flow f = generate_flow({4, 40000, 5});
+    std::vector<OrderBook> a;
+    std::vector<Rec> ra(4), rb(4);
+    for (auto& s : f.symbols) a.emplace_back(s);
+    const size_t cut = f.msgs.size() / 2;
+    for (size_t i = 0; i < cut; ++i) a[f.msgs[i].sym].process(f.msgs[i], ra[f.msgs[i].sym]);
+    std::vector<OrderBook> b;
+    for (auto& s : f.symbols) {
+        b.emplace_back(s);
+        OrderBook& src = a[s.id];
+        b.back().restore_state(src.phase(), src.last_price());
+        src.for_each_order([&](const RestingOrder& o) { b.back().restore_order(o); });
+    }
+    std::vector<Rec> ra2(4);
+    for (size_t i = cut; i < f.msgs.size(); ++i) {
+        a[f.msgs[i].sym].process(f.msgs[i], ra2[f.msgs[i].sym]);
+        b[f.msgs[i].sym].process(f.msgs[i], rb[f.msgs[i].sym]);
+    }
+    for (int s = 0; s < 4; ++s) {
+        bool same = ra2[s].trades == rb[s].trades;
+        CHECK(same);
+        std::vector<OrderId> oa, ob;
+        a[s].for_each_order([&](const RestingOrder& o) { oa.push_back(o.id); });
+        b[s].for_each_order([&](const RestingOrder& o) { ob.push_back(o.id); });
+        CHECK(oa == ob);
+    }
+}
+
 TEST(flat_map_vs_std) {
     FlatMap fm(16);
     std::unordered_map<uint64_t, uint32_t> ref;
@@ -216,28 +384,46 @@ TEST(flat_map_vs_std) {
     CHECK_EQ(fm.size(), ref.size());
 }
 
-// Differential test: fast book vs naive reference on random full-day flows.
+// All venue x self-trade-prevention combinations the book supports.
+static std::vector<BookConfig> all_configs() {
+    std::vector<BookConfig> v;
+    for (Venue venue : {Venue::SSE, Venue::SZSE})
+        for (StpPolicy stp : {StpPolicy::None, StpPolicy::CancelNewest, StpPolicy::CancelOldest, StpPolicy::CancelBoth}) {
+            BookConfig c; c.venue = venue; c.stp = stp;
+            v.push_back(c);
+        }
+    return v;
+}
+
+// Differential test: fast book vs naive reference on random full-day flows,
+// for every venue / STP combination. Few accounts -> frequent self-trades.
 TEST(differential_vs_reference) {
-    for (uint64_t seed = 1; seed <= 5; ++seed) {
-        Flow f = generate_flow({8, 60000, seed});
-        std::vector<OrderBook> fast;
-        std::vector<RefBook> ref;
-        std::vector<Rec> rec(f.symbols.size());
-        for (auto& s : f.symbols) { fast.emplace_back(s); ref.emplace_back(s); }
-        for (auto& m : f.msgs) { fast[m.sym].process(m, rec[m.sym]); ref[m.sym].process(m); }
-        size_t total = 0;
-        for (size_t i = 0; i < f.symbols.size(); ++i) {
-            CHECK_EQ(rec[i].trades.size(), ref[i].trades.size());
-            bool same = rec[i].trades == ref[i].trades;
-            CHECK(same);
-            total += rec[i].trades.size();
-            for (Side s : {Side::Buy, Side::Sell}) {
-                auto d = ref[i].depth(s);
-                for (auto& [p, q] : d) CHECK_EQ(fast[i].level_qty(s, p), q);
+    size_t total = 0, expired = 0;
+    for (const BookConfig& cfg : all_configs()) {
+        for (uint64_t seed = 1; seed <= 2; ++seed) {
+            FlowParams fp{8, 40000, seed};
+            fp.accounts = 20;
+            Flow f = generate_flow(fp);
+            std::vector<OrderBook> fast;
+            std::vector<RefBook> ref;
+            std::vector<Rec> rec(f.symbols.size());
+            for (auto& s : f.symbols) { fast.emplace_back(s, 64, cfg); ref.emplace_back(s, cfg); }
+            for (auto& m : f.msgs) { fast[m.sym].process(m, rec[m.sym]); ref[m.sym].process(m); }
+            for (size_t i = 0; i < f.symbols.size(); ++i) {
+                CHECK_EQ(rec[i].trades.size(), ref[i].trades.size());
+                bool same = rec[i].trades == ref[i].trades;
+                CHECK(same);
+                total += rec[i].trades.size();
+                expired += rec[i].expires.size();
+                std::vector<std::pair<OrderId, Qty>> fo;
+                fast[i].for_each_order([&](const RestingOrder& o) { fo.push_back({o.id, o.qty}); });
+                bool same_orders = fo == ref[i].orders();  // same orders, same FIFO order
+                CHECK(same_orders);
             }
         }
-        CHECK(total > 1000);
     }
+    std::printf("    %zu trades, %zu expired remainders across %zu configs\n", total, expired, all_configs().size());
+    CHECK(total > 10000);
 }
 
 // Randomised version of the libFuzzer target: many short adversarial streams
@@ -259,23 +445,31 @@ TEST(random_fuzz_vs_reference) {
     std::printf("    %d random streams, all identical\n", cases);
 }
 
-// L2 consistency: feed produced by the engine -> rebuilt book == engine book.
-TEST(l2_rebuild_matches_engine) {
-    Flow f = generate_flow({6, 80000, 99});
-    struct VecSink {
-        std::vector<TickRecord> v;
-        void write(const TickRecord& r) { v.push_back(r); }
-        void write_status(uint64_t seq, SymbolId sym, uint32_t t, Phase) { v.push_back({seq, sym, 'S', t, 0, 0, 0, 0, 'S'}); }
-    } sink;
-    L2Publisher<VecSink> pub{sink};
-    std::vector<OrderBook> books;
-    for (auto& s : f.symbols) books.emplace_back(s);
-    for (auto& m : f.msgs) { pub.sym = m.sym; books[m.sym].process(m, pub); }
+// L2 consistency: feed produced by the engine -> rebuilt book == engine book,
+// for both publication styles and with self-trade cancels in the stream.
+struct VecSink {
+    std::vector<TickRecord> v;
+    void write(const TickRecord& r) { v.push_back(r); }
+    void write_status(uint64_t seq, SymbolId sym, uint32_t t, Phase) { v.push_back({seq, sym, 'S', t, 0, 0, 0, 0, 'S'}); }
+};
 
-    L2Rebuilder rb;
+template <class Pub>
+static void check_l2_roundtrip(const BookConfig& cfg) {
+    FlowParams fp{6, 80000, 99};
+    fp.accounts = 30;
+    Flow f = generate_flow(fp);
+    VecSink sink;
+    Pub pub(sink);
+    std::vector<OrderBook> books;
+    for (auto& s : f.symbols) books.emplace_back(s, 64, cfg);
+    for (auto& m : f.msgs) pub.process(books[m.sym], m);
+
+    L2Rebuilder rb(cfg.venue);
     for (auto& r : sink.v) rb.apply(r);
+    rb.finish();
     CHECK_EQ(rb.stats().anomalies, 0u);
-    CHECK(rb.stats().trades_aggressor_unseen > 0);  // continuous trades: aggressor never rested
+    if (cfg.venue == Venue::SSE) CHECK(rb.stats().trades_aggressor_unseen > 0);  // aggressor never rested
+    else CHECK_EQ(rb.stats().trades_aggressor_unseen, 0u);                       // SZSE publishes every order
     for (size_t i = 0; i < books.size(); ++i) {
         size_t n_levels = 0;
         books[i].for_each_level([&](Side s, Price p, int64_t q, uint32_t) {
@@ -286,5 +480,12 @@ TEST(l2_rebuild_matches_engine) {
         });
         size_t rb_levels = rb.levels(i, Side::Buy)->size() + rb.levels(i, Side::Sell)->size();
         CHECK_EQ(rb_levels, n_levels);
+    }
+}
+
+TEST(l2_rebuild_matches_engine) {
+    for (const BookConfig& cfg : all_configs()) {
+        if (cfg.venue == Venue::SSE) check_l2_roundtrip<L2Publisher<VecSink>>(cfg);
+        else check_l2_roundtrip<SzsePublisher<VecSink>>(cfg);
     }
 }

@@ -1,6 +1,6 @@
 // Reference order book: deliberately naive (std::map + std::deque) and written
 // independently of OrderBook. Used only for differential testing — the fast
-// book must produce exactly the same trade stream as this one.
+// book must produce exactly the same trades and the same resting orders.
 #pragma once
 #include <algorithm>
 #include <cstdlib>
@@ -16,7 +16,7 @@ namespace me {
 
 class RefBook {
 public:
-    explicit RefBook(const SymbolInfo& info, CageConfig cage = {}) : info_(info), cage_(cage), last_(info.prev_close) {}
+    explicit RefBook(const SymbolInfo& info, BookConfig cfg = {}) : info_(info), cfg_(cfg), last_(info.prev_close) {}
 
     std::vector<Trade> trades;
 
@@ -28,61 +28,10 @@ public:
         }
         if (m.type == MsgType::Cancel) {
             auto it = loc_.find(m.id);
-            if (it == loc_.end()) return;
-            auto [side, px] = it->second;
-            auto& q = side == Side::Buy ? bids_[px] : asks_[px];
-            for (auto o = q.begin(); o != q.end(); ++o)
-                if (o->id == m.id) { q.erase(o); break; }
-            if (q.empty()) { if (side == Side::Buy) bids_.erase(px); else asks_.erase(px); }
-            loc_.erase(it);
+            if (it != loc_.end()) remove_order(it->second.first, it->second.second, m.id);
             return;
         }
-        // New
-        if (m.qty <= 0 || phase_ == Phase::Closed) return;
-        bool market = m.ord_type == OrdType::MarketBest5IOC;
-        if (market && is_auction(phase_)) return;
-        if (!market && (m.price < info_.lower_limit || m.price > info_.upper_limit)) return;
-        if (loc_.count(m.id)) return;
-        if (!market && phase_ == Phase::Continuous && cage_.enabled) {
-            // Written as plain floating-point bounds on purpose (independent of
-            // the integer arithmetic in OrderBook::within_cage).
-            auto best = [](auto& mp) { return mp.empty() ? -1 : mp.begin()->first; };
-            Price bb = best(bids_), ba = best(asks_);
-            if (m.side == Side::Buy) {
-                Price base = ba >= 0 ? ba : bb >= 0 ? bb : last_;
-                double hi = std::max(base * (1 + cage_.pct / 100.0), double(base + cage_.min_ticks));
-                if (m.price > hi + 1e-9) return;
-            } else {
-                Price base = bb >= 0 ? bb : ba >= 0 ? ba : last_;
-                double lo = std::min(base * (1 - cage_.pct / 100.0), double(base - cage_.min_ticks));
-                if (m.price < lo - 1e-9) return;
-            }
-        }
-        Qty left = m.qty;
-        if (phase_ == Phase::Continuous) {
-            int levels = 0;
-            if (m.side == Side::Buy) {
-                while (left > 0 && !asks_.empty()) {
-                    auto it = asks_.begin();
-                    if (market ? levels == 5 : it->first > m.price) break;
-                    ++levels;
-                    left = eat(it->second, left, it->first, m, true);
-                    if (it->second.empty()) asks_.erase(it);
-                }
-            } else {
-                while (left > 0 && !bids_.empty()) {
-                    auto it = bids_.begin();
-                    if (market ? levels == 5 : it->first < m.price) break;
-                    ++levels;
-                    left = eat(it->second, left, it->first, m, false);
-                    if (it->second.empty()) bids_.erase(it);
-                }
-            }
-        }
-        if (left > 0 && !market) {
-            (m.side == Side::Buy ? bids_[m.price] : asks_[m.price]).push_back({m.id, left});
-            loc_[m.id] = {m.side, m.price};
-        }
+        on_new(m);
     }
 
     size_t live_orders() const { return loc_.size(); }
@@ -95,24 +44,128 @@ public:
         return d;
     }
 
-private:
-    struct O { OrderId id; Qty qty; };
+    // Resting orders in priority order (same convention as OrderBook::for_each_order).
+    std::vector<std::pair<OrderId, Qty>> orders() const {
+        std::vector<std::pair<OrderId, Qty>> v;
+        for (auto& [p, q] : bids_) for (auto& o : q) v.push_back({o.id, o.qty});
+        for (auto& [p, q] : asks_) for (auto& o : q) v.push_back({o.id, o.qty});
+        return v;
+    }
 
-    Qty eat(std::deque<O>& q, Qty left, Price px, const OrderMsg& m, bool buyer_aggr) {
-        while (left > 0 && !q.empty()) {
-            O& o = q.front();
-            Qty x = std::min(o.qty, left);
-            o.qty -= x; left -= x;
-            last_ = px;
-            if (buyer_aggr) trades.push_back({m.id, o.id, px, x, 'B', m.time});
-            else trades.push_back({o.id, m.id, px, x, 'S', m.time});
-            if (o.qty == 0) { loc_.erase(o.id); q.pop_front(); }
+private:
+    struct O { OrderId id; Qty qty; AccountId acct; };
+
+    void on_new(const OrderMsg& m) {
+        if (m.qty <= 0 || phase_ == Phase::Closed || loc_.count(m.id)) return;
+        const bool market = m.ord_type != OrdType::Limit;
+        if (market && phase_ != Phase::Continuous) return;
+        const bool buy = m.side == Side::Buy;
+        const bool cont = phase_ == Phase::Continuous;
+
+        Price px = m.price;
+        bool five = false;
+        switch (m.ord_type) {
+            case OrdType::Limit:
+                if (px < info_.lower_limit || px > info_.upper_limit) return;
+                if (cont && !cage_ok(m.side, px)) return;
+                break;
+            case OrdType::OwnBest:
+                if (buy ? bids_.empty() : asks_.empty()) return;
+                px = buy ? bids_.begin()->first : asks_.begin()->first;
+                break;
+            case OrdType::CounterBest:
+                if (buy ? asks_.empty() : bids_.empty()) return;
+                px = buy ? asks_.begin()->first : bids_.begin()->first;
+                break;
+            case OrdType::MarketBest5ToLimit:
+                if (buy ? asks_.empty() : bids_.empty()) return;
+                five = true;
+                break;
+            case OrdType::MarketBest5IOC:
+                five = true;
+                break;
         }
-        return left;
+
+        Qty left = m.qty;
+        bool killed = false;
+        Price last_fill = 0;
+        if (cont) {
+            if (buy) match_side(asks_, m, five, px, left, killed, last_fill, [&](Price p) { return p <= px; });
+            else match_side(bids_, m, five, px, left, killed, last_fill, [&](Price p) { return p >= px; });
+        }
+        if (left == 0 || killed) return;
+        if (m.ord_type == OrdType::MarketBest5IOC) return;
+        Price rp = px;
+        if (m.ord_type == OrdType::MarketBest5ToLimit) {
+            if (last_fill == 0) return;  // nothing filled -> remainder dropped
+            rp = last_fill;
+        }
+        (buy ? bids_[rp] : asks_[rp]).push_back({m.id, left, m.account});
+        loc_[m.id] = {m.side, rp};
+    }
+
+    template <class Book, class Ok>
+    void match_side(Book& book, const OrderMsg& m, bool five, Price, Qty& left, bool& killed, Price& last_fill,
+                    Ok price_ok) {
+        const bool buyer = m.side == Side::Buy;
+        const bool stp_on = m.account != 0 && cfg_.stp != StpPolicy::None;
+        const bool cancel_resting = cfg_.stp == StpPolicy::CancelOldest || cfg_.stp == StpPolicy::CancelBoth;
+        const bool kill_incoming = cfg_.stp == StpPolicy::CancelNewest || cfg_.stp == StpPolicy::CancelBoth;
+        int levels = 0;
+        while (left > 0 && !book.empty()) {
+            auto it = book.begin();
+            const Price p = it->first;
+            if (five ? levels == 5 : !price_ok(p)) break;
+            ++levels;
+            auto& q = it->second;
+            while (left > 0 && !q.empty()) {
+                O& o = q.front();
+                if (stp_on && o.acct == m.account) {
+                    if (cancel_resting) { loc_.erase(o.id); q.pop_front(); }
+                    if (kill_incoming) { killed = true; break; }
+                    continue;
+                }
+                Qty x = std::min(o.qty, left);
+                o.qty -= x; left -= x;
+                last_ = last_fill = p;
+                if (buyer) trades.push_back({m.id, o.id, p, x, 'B', m.time});
+                else trades.push_back({o.id, m.id, p, x, 'S', m.time});
+                if (o.qty == 0) { loc_.erase(o.id); q.pop_front(); }
+            }
+            if (q.empty()) book.erase(it);
+            if (killed) return;
+        }
+    }
+
+    bool cage_ok(Side s, Price p) const {
+        if (!cfg_.cage.enabled) return true;
+        // Written as plain floating-point bounds on purpose (independent of the
+        // integer arithmetic in OrderBook::within_cage).
+        Price bb = bids_.empty() ? -1 : bids_.begin()->first;
+        Price ba = asks_.empty() ? -1 : asks_.begin()->first;
+        const double pct = cfg_.cage.pct / 100.0;
+        if (s == Side::Buy) {
+            Price base = ba >= 0 ? ba : bb >= 0 ? bb : last_;
+            return p <= std::max(base * (1 + pct), double(base + cfg_.cage.min_ticks)) + 1e-9;
+        }
+        Price base = bb >= 0 ? bb : ba >= 0 ? ba : last_;
+        return p >= std::min(base * (1 - pct), double(base - cfg_.cage.min_ticks)) - 1e-9;
+    }
+
+    void remove_order(Side side, Price px, OrderId id) {
+        if (side == Side::Buy) erase_from(bids_, px, id); else erase_from(asks_, px, id);
+        loc_.erase(id);
+    }
+    template <class Book>
+    static void erase_from(Book& book, Price px, OrderId id) {
+        auto& q = book[px];
+        for (auto o = q.begin(); o != q.end(); ++o)
+            if (o->id == id) { q.erase(o); break; }
+        if (q.empty()) book.erase(px);
     }
 
     void uncross(uint32_t time) {
-        // Gather every declared price and evaluate the SSE rules by brute force.
+        // Gather every declared price and evaluate the exchange rules by brute force.
         std::map<Price, int64_t> bid_at, ask_at;
         for (auto& [p, q] : bids_) for (auto& o : q) bid_at[p] += o.qty;
         for (auto& [p, q] : asks_) for (auto& o : q) ask_at[p] += o.qty;
@@ -145,7 +198,15 @@ private:
             }
         }
         if (best.empty()) return;
-        Price P = (best.front() + best.back() + 1) / 2;
+        Price P;
+        if (cfg_.venue == Venue::SZSE) {
+            const Price ref = phase_ == Phase::OpeningAuction ? info_.prev_close : last_;
+            P = best.front();
+            for (Price c : best)  // strictly closer wins; ascending order keeps the lower on ties
+                if (std::abs(c - ref) < std::abs(P - ref)) P = c;
+        } else {
+            P = (best.front() + best.back() + 1) / 2;
+        }
         last_ = P;
         while (!bids_.empty() && !asks_.empty() && bids_.begin()->first >= P && asks_.begin()->first <= P) {
             auto& bq = bids_.begin()->second;
@@ -161,7 +222,7 @@ private:
     }
 
     SymbolInfo info_;
-    CageConfig cage_;
+    BookConfig cfg_;
     Price last_;
     Phase phase_ = Phase::Closed;
     std::map<Price, std::deque<O>, std::greater<Price>> bids_;

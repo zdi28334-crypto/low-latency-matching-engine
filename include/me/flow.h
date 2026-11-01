@@ -4,7 +4,7 @@
 // that produces a full trading day per symbol:
 //   opening call auction -> continuous trading -> closing call auction -> close
 // Order mix in continuous trading (roughly what a real book sees):
-//   ~55% passive limit, ~25% cancel, ~15% marketable limit, ~5% best-5 IOC.
+//   ~55% passive limit, ~25% cancel, ~15% marketable limit, ~5% market orders (best-5 IOC, best-5 to limit, own best, counter best).
 #pragma once
 #include <algorithm>
 #include <cmath>
@@ -28,6 +28,7 @@ struct FlowParams {
     int symbols = 100;
     int64_t orders = 2'000'000;  // approx. total New+Cancel messages
     uint64_t seed = 42;
+    uint32_t accounts = 300;
 };
 
 inline SymbolInfo make_symbol(SymbolId id, Price prev_close) {
@@ -67,6 +68,9 @@ inline Flow generate_flow(const FlowParams& p) {
         return std::max(s.lower_limit, std::min(s.upper_limit, q));
     };
     auto remember = [&](State& s, OrderId id) { s.recent[s.rpos++ & 255] = id; };
+    // A few hundred accounts, so the same account occasionally meets itself
+    // on both sides of a book (exercises self-trade prevention).
+    auto account = [&] { return static_cast<AccountId>(1 + rng() % p.accounts); };
     auto phase_msg = [&](Phase ph, uint32_t t) {
         for (int i = 0; i < p.symbols; ++i) {
             OrderMsg m; m.type = MsgType::Phase; m.sym = i; m.phase = ph; m.time = t;
@@ -91,6 +95,7 @@ inline Flow generate_flow(const FlowParams& p) {
             double off = (U(rng) - 0.5) * 0.012 * ref;  // ±0.6%
             m.price = clamp(si, ref + off);
             m.time = clock_at(double(k) / n, start, end);
+            m.account = account();
             f.msgs.push_back(m);
             remember(st[s], m.id);
         }
@@ -128,10 +133,14 @@ inline Flow generate_flow(const FlowParams& p) {
             m.price = clamp(si, ss.mid - dir * off);
         } else if (r < 0.95) {  // marketable limit: cross mid by 0..3 ticks
             m.price = clamp(si, ss.mid + dir * std::floor(U(rng) * 4));
-        } else {
-            m.ord_type = OrdType::MarketBest5IOC;
+        } else {                // market order types (2% / 1% / 1% / 1%)
+            m.ord_type = r < 0.97   ? OrdType::MarketBest5IOC
+                         : r < 0.98 ? OrdType::MarketBest5ToLimit
+                         : r < 0.99 ? OrdType::OwnBest
+                                    : OrdType::CounterBest;
             m.price = 0;
         }
+        m.account = account();
         f.msgs.push_back(m);
         remember(ss, m.id);
     }
@@ -142,11 +151,11 @@ inline Flow generate_flow(const FlowParams& p) {
     return f;
 }
 
-// ---- binary file: "MEFLOW01" | u32 nsym | SymbolInfo[] | u64 nmsg | OrderMsg[]
+// ---- binary file: "MEFLOW02" | u32 nsym | SymbolInfo[] | u64 nmsg | OrderMsg[]
 inline void save_flow(const Flow& f, const std::string& path) {
     FILE* fp = std::fopen(path.c_str(), "wb");
     if (!fp) throw std::runtime_error("cannot open " + path);
-    std::fwrite("MEFLOW01", 1, 8, fp);
+    std::fwrite("MEFLOW02", 1, 8, fp);
     uint32_t ns = f.symbols.size();
     uint64_t nm = f.msgs.size();
     std::fwrite(&ns, sizeof ns, 1, fp);
@@ -163,7 +172,7 @@ inline Flow load_flow(const std::string& path) {
     Flow f;
     uint32_t ns = 0;
     uint64_t nm = 0;
-    if (std::fread(magic, 1, 8, fp) != 8 || std::memcmp(magic, "MEFLOW01", 8) != 0)
+    if (std::fread(magic, 1, 8, fp) != 8 || std::memcmp(magic, "MEFLOW02", 8) != 0)
         throw std::runtime_error("bad flow file " + path);
     if (std::fread(&ns, sizeof ns, 1, fp) != 1) throw std::runtime_error("truncated");
     f.symbols.resize(ns);

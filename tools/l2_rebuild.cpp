@@ -1,5 +1,6 @@
 // Level-2 order-book reconstruction from a tick-by-tick feed.
-//   l2_rebuild <ticks.csv> [--expect engine_snapshot.csv] [--watch SYM --l5 out.csv]
+//   l2_rebuild <ticks.csv> [--venue sse|szse] [--expect engine_snapshot.csv] [--watch SYM --l5 out.csv]
+// --venue  : publication style of the feed (default sse)
 // --expect : compare the rebuilt books level by level with a reference snapshot
 // --watch  : write a 5-level depth snapshot of one security after every trade
 //            (the market state a strategy / backtest would see).
@@ -16,13 +17,18 @@
 using namespace me;
 
 int main(int argc, char** argv) {
-    if (argc < 2) { std::fprintf(stderr, "usage: l2_rebuild ticks.csv [--expect snap.csv] [--watch SYM --l5 out.csv]\n"); return 1; }
+    if (argc < 2) {
+        std::fprintf(stderr, "usage: l2_rebuild ticks.csv [--venue sse|szse] [--expect snap.csv] [--watch SYM --l5 out.csv]\n");
+        return 1;
+    }
+    Venue venue = Venue::SSE;
     std::string expect, l5path;
     long watch = -1;
     for (int i = 2; i + 1 < argc; i += 2) {
         if (!std::strcmp(argv[i], "--expect")) expect = argv[i + 1];
         else if (!std::strcmp(argv[i], "--watch")) watch = std::atol(argv[i + 1]);
         else if (!std::strcmp(argv[i], "--l5")) l5path = argv[i + 1];
+        else if (!std::strcmp(argv[i], "--venue")) venue = std::strcmp(argv[i + 1], "szse") ? Venue::SSE : Venue::SZSE;
     }
     FILE* in = std::fopen(argv[1], "r");
     if (!in) { std::perror(argv[1]); return 1; }
@@ -34,7 +40,7 @@ int main(int argc, char** argv) {
         std::fputc('\n', l5);
     }
 
-    L2Rebuilder rb;
+    L2Rebuilder rb(venue);
     char line[256];
     TickRecord r;
     uint64_t n = 0, bad = 0;
@@ -46,13 +52,15 @@ int main(int argc, char** argv) {
         rb.apply(r);
         ++n;
         if (r.type == 'T' && long(r.sym) == watch) last_px = r.price;
-        // Snapshot after continuous trades and after each status change; skip
-        // the individual auction ('N') prints — mid-uncross the book is
-        // transiently crossed, the state after the uncross is what matters.
+        // Snapshot after continuous trades and after each status change. A book
+        // is transiently crossed mid-uncross (both venues) and, for SZSE, while
+        // a marketable order published on receipt is still being matched;
+        // only uncrossed states are written.
         bool snap = (r.type == 'T' && r.bs != 'N') || r.type == 'S';
         if (l5 && snap && long(r.sym) == watch) {
-            std::fprintf(l5, "%lu,%09u,%s", (unsigned long)r.seq, r.time, last_px ? ticks_to_str(last_px).c_str() : "");
             auto bids = rb.depth(r.sym, Side::Buy, 5), asks = rb.depth(r.sym, Side::Sell, 5);
+            if (!bids.empty() && !asks.empty() && bids[0].first >= asks[0].first) continue;
+            std::fprintf(l5, "%lu,%09u,%s", (unsigned long)r.seq, r.time, last_px ? ticks_to_str(last_px).c_str() : "");
             for (size_t k = 0; k < 5; ++k)
                 k < bids.size() ? std::fprintf(l5, ",%s,%ld", ticks_to_str(bids[k].first).c_str(), (long)bids[k].second)
                                 : std::fprintf(l5, ",,");
@@ -62,14 +70,15 @@ int main(int argc, char** argv) {
             std::fputc('\n', l5);
         }
     }
+    rb.finish();
     double secs = (now_ns() - t0) / 1e9;
     std::fclose(in);
     if (l5) std::fclose(l5);
     const auto& st = rb.stats();
     std::printf("rebuilt from %lu records in %.2fs (%.2f M rec/s), parse errors=%lu\n", (unsigned long)n, secs,
                 n / secs / 1e6, (unsigned long)bad);
-    std::printf("  A=%lu D=%lu T=%lu S=%lu | trades whose aggressor never rested=%lu | anomalies=%lu\n",
-                (unsigned long)st.adds, (unsigned long)st.dels, (unsigned long)st.trades, (unsigned long)st.status,
+    std::printf("  [%s] orders=%lu cancels=%lu trades=%lu status=%lu | trades whose aggressor never rested=%lu | anomalies=%lu\n",
+                venue == Venue::SSE ? "SSE" : "SZSE", (unsigned long)st.adds, (unsigned long)st.dels, (unsigned long)st.trades, (unsigned long)st.status,
                 (unsigned long)st.trades_aggressor_unseen, (unsigned long)st.anomalies);
 
     if (expect.empty()) return st.anomalies ? 2 : 0;

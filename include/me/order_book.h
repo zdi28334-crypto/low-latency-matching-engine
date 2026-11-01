@@ -1,7 +1,7 @@
 // Single-symbol limit order book with price-time priority.
 //
 // Design (latency-oriented):
-//  * SSE A-shares have a daily price band (涨跌停), so every possible price is
+//  * A-shares have a daily price band (涨跌停), so every possible price is
 //    known up front. Each side is a flat array of price levels indexed by
 //    (price - lower_limit): O(1) level lookup, no tree rebalancing.
 //  * A per-side bitmap of non-empty levels finds the next best price with a
@@ -13,12 +13,13 @@
 //
 // Listener interface (all methods required):
 //   void on_trade(const Trade&);
-//   void on_rest(OrderId, Side, Price, Qty residual, uint32_t time);   // -> L2 'A'
-//   void on_cancel(OrderId, Side, Price, Qty remaining, uint32_t time); // -> L2 'D'
+//   void on_rest(OrderId, Side, Price, Qty residual, uint32_t time);    // order now resting
+//   void on_cancel(OrderId, Side, Price, Qty remaining, uint32_t time);  // resting order removed
+//   void on_expire(OrderId, Side, Qty remaining, ExpireReason, uint32_t time);
+//                                         // unfilled remainder of an incoming order dropped
 //   void on_reject(OrderId, RejectReason);
 //   void on_phase(Phase, uint32_t time);
 #pragma once
-#include <cassert>
 #include <cstdint>
 #include <vector>
 
@@ -34,13 +35,23 @@ struct AuctionResult {
     int64_t imbalance = 0;
 };
 
+// One resting order, as captured in a snapshot (FIFO order preserved by the
+// order in which for_each_order visits them).
+struct RestingOrder {
+    OrderId id;
+    AccountId account;
+    Price price;
+    Qty qty;
+    Side side;
+};
+
 class OrderBook {
 public:
     static constexpr uint32_t NIL = 0xFFFFFFFFu;
 
-    explicit OrderBook(const SymbolInfo& info, size_t expected_orders = 4096, CageConfig cage = {})
+    explicit OrderBook(const SymbolInfo& info, size_t expected_orders = 4096, BookConfig cfg = {})
         : info_(info),
-          cage_(cage),
+          cfg_(cfg),
           last_px_(info.prev_close),
           lo_(info.lower_limit),
           nlevels_(info.upper_limit - info.lower_limit + 1),
@@ -53,6 +64,7 @@ public:
     }
 
     const SymbolInfo& info() const { return info_; }
+    const BookConfig& config() const { return cfg_; }
     Phase phase() const { return phase_; }
     size_t live_orders() const { return index_.size(); }
 
@@ -64,13 +76,14 @@ public:
 
     // Price-cage check for a limit order arriving in continuous trading.
     bool within_cage(Side s, Price p) const {
-        if (!cage_.enabled) return true;
+        const CageConfig& c = cfg_.cage;
+        if (!c.enabled) return true;
         if (s == Side::Buy) {
             Price base = has_ask() ? best_ask() : has_bid() ? best_bid() : last_px_;
-            return int64_t(p) * 100 <= int64_t(base) * (100 + cage_.pct) || p <= base + cage_.min_ticks;
+            return int64_t(p) * 100 <= int64_t(base) * (100 + c.pct) || p <= base + c.min_ticks;
         }
         Price base = has_bid() ? best_bid() : has_ask() ? best_ask() : last_px_;
-        return int64_t(p) * 100 >= int64_t(base) * (100 - cage_.pct) || p >= base - cage_.min_ticks;
+        return int64_t(p) * 100 >= int64_t(base) * (100 - c.pct) || p >= base - c.min_ticks;
     }
 
     // Aggregated depth at a price (for snapshots / tests).
@@ -89,6 +102,25 @@ public:
             if (asks_[i].count) f(Side::Sell, lo_ + i, asks_[i].total, asks_[i].count);
     }
 
+    // Visit every resting order in priority order: bids best -> worst, then
+    // asks best -> worst, FIFO within a level. Re-inserting the orders in this
+    // order with restore_order() reproduces the book exactly.
+    template <class F>
+    void for_each_order(F&& f) const {
+        auto visit = [&](const Level& lv, int idx) {
+            for (uint32_t ni = lv.head; ni != NIL; ni = pool_[ni].next) {
+                const Node& n = pool_[ni];
+                f(RestingOrder{n.id, n.account, lo_ + idx, n.qty, n.side});
+            }
+        };
+        for (int i = nlevels_ - 1; i >= 0; --i) if (bids_[i].count) visit(bids_[i], i);
+        for (int i = 0; i < nlevels_; ++i) if (asks_[i].count) visit(asks_[i], i);
+    }
+
+    // Snapshot restore (crash recovery). Only valid on a freshly constructed book.
+    void restore_state(Phase ph, Price last_px) { phase_ = ph; last_px_ = last_px; }
+    void restore_order(const RestingOrder& o) { rest(o.id, o.side, o.price - lo_, o.qty, o.account); }
+
     // ---------------------------------------------------------------- entry
     template <class L>
     void process(const OrderMsg& m, L& lis) {
@@ -99,12 +131,15 @@ public:
         }
     }
 
-    // SSE call-auction price determination (上交所交易规则 3.6):
+    // Call-auction price determination (SSE 交易规则 3.6 / SZSE 3.5.2):
     //  (1) maximise executed volume;
     //  (2) all bids above / asks below the price are fully filled;
     //  (3) at the price, at least one side is fully filled (implied by (1));
-    //  tie-break: minimise unfilled volume (imbalance); if still tied, take
-    //  the midpoint of the remaining prices, rounded half-up to a tick.
+    //  tie-break 1: minimise unfilled volume (imbalance);
+    //  tie-break 2: SSE  -> midpoint of the remaining prices (rounded half-up)
+    //               SZSE -> price closest to previous close (opening auction)
+    //                       or to the last trade price (other auctions);
+    //                       equidistant -> the lower price.
     // Also used during the auction to publish the indicative price (虚拟参考价).
     AuctionResult auction_price() const {
         AuctionResult r;
@@ -117,8 +152,11 @@ public:
         acc = 0;
         for (int i = a; i <= b; ++i) { acc += asks_[i].total; cum_sell_[i - a] = acc; }
 
+        const bool szse = cfg_.venue == Venue::SZSE;
+        const int ref = (phase_ == Phase::OpeningAuction ? info_.prev_close : last_px_) - lo_;
+        auto dist = [&](int i) { return i > ref ? i - ref : ref - i; };
         int64_t best_vol = 0, best_imb = 0;
-        int lo_idx = -1, hi_idx = -1;
+        int lo_idx = -1, hi_idx = -1, pick = -1;
         for (int pass = 0; pass < 2 && lo_idx < 0; ++pass) {
             for (int i = a; i <= b; ++i) {
                 if (!bids_[i].count && !asks_[i].count) continue;  // only declared prices
@@ -131,15 +169,16 @@ public:
                 }
                 int64_t imb = bv > sv ? bv - sv : sv - bv;
                 if (vol > best_vol || (vol == best_vol && imb < best_imb)) {
-                    best_vol = vol; best_imb = imb; lo_idx = hi_idx = i;
+                    best_vol = vol; best_imb = imb; lo_idx = hi_idx = pick = i;
                 } else if (vol == best_vol && imb == best_imb) {
                     hi_idx = i;
+                    if (dist(i) < dist(pick)) pick = i;  // ascending scan keeps the lower on ties
                 }
             }
         }
         if (lo_idx < 0) return r;
         r.crossed = true;
-        r.price = lo_ + (lo_idx + hi_idx + 1) / 2;  // midpoint, half-up
+        r.price = lo_ + (szse ? pick : (lo_idx + hi_idx + 1) / 2);
         r.volume = best_vol;
         r.imbalance = best_imb;
         return r;
@@ -151,6 +190,7 @@ private:
         Qty qty;
         uint32_t prev, next;
         int32_t level;  // index into side array
+        AccountId account;
         Side side;
     };
     struct Level {
@@ -164,36 +204,66 @@ private:
     void on_new(const OrderMsg& m, L& lis) {
         if (m.qty <= 0) return lis.on_reject(m.id, RejectReason::BadQty);
         if (phase_ == Phase::Closed) return lis.on_reject(m.id, RejectReason::Closed);
-        const bool market = m.ord_type == OrdType::MarketBest5IOC;
-        if (market && is_auction(phase_)) return lis.on_reject(m.id, RejectReason::MarketInAuction);
-        if (!market && (m.price < info_.lower_limit || m.price > info_.upper_limit))
-            return lis.on_reject(m.id, RejectReason::OutOfBand);
+        const OrdType t = m.ord_type;
+        if (is_market(t) && is_auction(phase_)) return lis.on_reject(m.id, RejectReason::MarketInAuction);
         if (index_.find(m.id)) return lis.on_reject(m.id, RejectReason::DuplicateId);
-        if (!market && phase_ == Phase::Continuous && !within_cage(m.side, m.price))
-            return lis.on_reject(m.id, RejectReason::PriceCage);
+        const bool buy = m.side == Side::Buy;
+        const bool own_empty = buy ? !has_bid() : !has_ask();
+        const bool opp_empty = buy ? !has_ask() : !has_bid();
 
+        Price px = m.price;  // effective limit price
+        switch (t) {
+            case OrdType::Limit:
+                if (px < info_.lower_limit || px > info_.upper_limit)
+                    return lis.on_reject(m.id, RejectReason::OutOfBand);
+                if (phase_ == Phase::Continuous && !within_cage(m.side, px))
+                    return lis.on_reject(m.id, RejectReason::PriceCage);
+                break;
+            case OrdType::OwnBest:
+                if (own_empty) return lis.on_reject(m.id, RejectReason::NoCounterparty);
+                px = buy ? best_bid() : best_ask();
+                break;
+            case OrdType::CounterBest:
+                if (opp_empty) return lis.on_reject(m.id, RejectReason::NoCounterparty);
+                px = buy ? best_ask() : best_bid();
+                break;
+            case OrdType::MarketBest5ToLimit:
+                if (opp_empty) return lis.on_reject(m.id, RejectReason::NoCounterparty);
+                break;
+            case OrdType::MarketBest5IOC:
+                break;
+        }
+
+        const bool five = t == OrdType::MarketBest5IOC || t == OrdType::MarketBest5ToLimit;
         Qty left = m.qty;
+        bool killed = false;
+        Price last_fill = 0;
         if (phase_ == Phase::Continuous) {
-            left = (m.side == Side::Buy) ? sweep<Side::Buy>(m, market, lis)
-                                         : sweep<Side::Sell>(m, market, lis);
+            left = buy ? sweep<Side::Buy>(m, five, px, killed, last_fill, lis)
+                       : sweep<Side::Sell>(m, five, px, killed, last_fill, lis);
         }
-        if (left > 0 && !market) {
-            rest(m.id, m.side, m.price - lo_, left);
-            lis.on_rest(m.id, m.side, m.price, left, m.time);
-        }
-        // market remainder is cancelled (IOC); never rests, so no L2 'A'/'D'.
+        if (left == 0) return;
+        if (killed) return lis.on_expire(m.id, m.side, left, ExpireReason::SelfTrade, m.time);
+        if (t == OrdType::MarketBest5IOC || (t == OrdType::MarketBest5ToLimit && last_fill == 0))
+            return lis.on_expire(m.id, m.side, left, ExpireReason::IOC, m.time);
+        const Price rest_px = t == OrdType::MarketBest5ToLimit ? last_fill : px;
+        rest(m.id, m.side, rest_px - lo_, left, m.account);
+        lis.on_rest(m.id, m.side, rest_px, left, m.time);
     }
 
     // Match an aggressive order against the opposite side; returns leftover.
+    // five: sweep at most 5 price levels, ignoring limit_px.
     template <Side S, class L>
-    Qty sweep(const OrderMsg& m, bool market, L& lis) {
+    Qty sweep(const OrderMsg& m, bool five, Price limit_px, bool& killed, Price& last_fill, L& lis) {
+        constexpr Side O = S == Side::Buy ? Side::Sell : Side::Buy;
+        const StpPolicy stp = m.account ? cfg_.stp : StpPolicy::None;
         Qty left = m.qty;
         int levels_used = 0;
-        const int limit_idx = m.price - lo_;
+        const int limit_idx = limit_px - lo_;
         while (left > 0) {
             int idx = (S == Side::Buy) ? best_ask_ : best_bid_;
             if (idx < 0) break;
-            if (market) {
+            if (five) {
                 if (levels_used == 5) break;
             } else if (S == Side::Buy ? idx > limit_idx : idx < limit_idx) {
                 break;
@@ -204,14 +274,28 @@ private:
             while (left > 0 && lv.head != NIL) {
                 uint32_t ni = lv.head;
                 Node& rn = pool_[ni];
+                if (stp != StpPolicy::None && rn.account == m.account) {
+                    if (stp == StpPolicy::CancelOldest || stp == StpPolicy::CancelBoth) {
+                        const OrderId rid = rn.id;
+                        const Qty rq = rn.qty;
+                        lv.total -= rq;
+                        unlink(ni, lv, O);
+                        lis.on_cancel(rid, O, px, rq, m.time);
+                    }
+                    if (stp == StpPolicy::CancelNewest || stp == StpPolicy::CancelBoth) {
+                        killed = true;
+                        return left;
+                    }
+                    continue;
+                }
                 Qty q = rn.qty < left ? rn.qty : left;
                 left -= q;
                 rn.qty -= q;
                 lv.total -= q;
-                last_px_ = px;
+                last_px_ = last_fill = px;
                 if (S == Side::Buy) lis.on_trade(Trade{m.id, rn.id, px, q, 'B', m.time});
                 else lis.on_trade(Trade{rn.id, m.id, px, q, 'S', m.time});
-                if (rn.qty == 0) unlink(ni, lv, S == Side::Buy ? Side::Sell : Side::Buy);
+                if (rn.qty == 0) unlink(ni, lv, O);
             }
         }
         return left;
@@ -241,6 +325,7 @@ private:
         lis.on_phase(np, time);
     }
 
+    // Self-trade prevention is not applied in the auction uncross.
     template <class L>
     void uncross(uint32_t time, L& lis) {
         AuctionResult r = auction_price();
@@ -264,12 +349,12 @@ private:
     }
 
     // ------------------------------------------------------- book plumbing
-    void rest(OrderId id, Side s, int idx, Qty q) {
+    void rest(OrderId id, Side s, int idx, Qty q, AccountId account) {
         uint32_t ni;
         if (!free_.empty()) { ni = free_.back(); free_.pop_back(); }
         else { ni = static_cast<uint32_t>(pool_.size()); pool_.emplace_back(); }
         Level& lv = (s == Side::Buy) ? bids_[idx] : asks_[idx];
-        pool_[ni] = Node{id, q, lv.tail, NIL, idx, s};
+        pool_[ni] = Node{id, q, lv.tail, NIL, idx, account, s};
         if (lv.tail != NIL) pool_[lv.tail].next = ni; else lv.head = ni;
         lv.tail = ni;
         lv.total += q;
@@ -319,7 +404,7 @@ private:
     }
 
     SymbolInfo info_;
-    CageConfig cage_;
+    BookConfig cfg_;
     Price last_px_;
     Price lo_;
     int nlevels_;

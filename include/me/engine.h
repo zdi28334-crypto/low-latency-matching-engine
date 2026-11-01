@@ -39,6 +39,7 @@ enum class LogMode { None, Sync, Async };
 struct EngineOptions {
     int shards = 2;
     size_t queue_capacity = 1 << 16;
+    BookConfig book;  // venue, self-trade prevention, price cage
     LogMode log_mode = LogMode::Async;
     std::string log_path = "engine.log";
     bool record_latency = true;
@@ -54,7 +55,7 @@ bool pin_current_thread(int cpu);
 
 // Latency histograms are in TscClock ticks; convert with TscClock::ns_per_tick().
 struct ShardStats {
-    uint64_t msgs = 0, trades = 0, rests = 0, cancels = 0, rejects = 0;
+    uint64_t msgs = 0, trades = 0, rests = 0, cancels = 0, expires = 0, rejects = 0;
     int64_t traded_qty = 0;
     LatencyHistogram queue_wait, match_core, publish, e2e;
 };
