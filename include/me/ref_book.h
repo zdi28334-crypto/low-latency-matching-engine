@@ -16,7 +16,7 @@ namespace me {
 
 class RefBook {
 public:
-    explicit RefBook(const SymbolInfo& info) : info_(info) {}
+    explicit RefBook(const SymbolInfo& info, CageConfig cage = {}) : info_(info), cage_(cage), last_(info.prev_close) {}
 
     std::vector<Trade> trades;
 
@@ -43,6 +43,21 @@ public:
         if (market && is_auction(phase_)) return;
         if (!market && (m.price < info_.lower_limit || m.price > info_.upper_limit)) return;
         if (loc_.count(m.id)) return;
+        if (!market && phase_ == Phase::Continuous && cage_.enabled) {
+            // Written as plain floating-point bounds on purpose (independent of
+            // the integer arithmetic in OrderBook::within_cage).
+            auto best = [](auto& mp) { return mp.empty() ? -1 : mp.begin()->first; };
+            Price bb = best(bids_), ba = best(asks_);
+            if (m.side == Side::Buy) {
+                Price base = ba >= 0 ? ba : bb >= 0 ? bb : last_;
+                double hi = std::max(base * (1 + cage_.pct / 100.0), double(base + cage_.min_ticks));
+                if (m.price > hi + 1e-9) return;
+            } else {
+                Price base = bb >= 0 ? bb : ba >= 0 ? ba : last_;
+                double lo = std::min(base * (1 - cage_.pct / 100.0), double(base - cage_.min_ticks));
+                if (m.price < lo - 1e-9) return;
+            }
+        }
         Qty left = m.qty;
         if (phase_ == Phase::Continuous) {
             int levels = 0;
@@ -70,6 +85,8 @@ public:
         }
     }
 
+    size_t live_orders() const { return loc_.size(); }
+
     // price -> total qty
     std::map<Price, int64_t> depth(Side s) const {
         std::map<Price, int64_t> d;
@@ -86,6 +103,7 @@ private:
             O& o = q.front();
             Qty x = std::min(o.qty, left);
             o.qty -= x; left -= x;
+            last_ = px;
             if (buyer_aggr) trades.push_back({m.id, o.id, px, x, 'B', m.time});
             else trades.push_back({o.id, m.id, px, x, 'S', m.time});
             if (o.qty == 0) { loc_.erase(o.id); q.pop_front(); }
@@ -128,6 +146,7 @@ private:
         }
         if (best.empty()) return;
         Price P = (best.front() + best.back() + 1) / 2;
+        last_ = P;
         while (!bids_.empty() && !asks_.empty() && bids_.begin()->first >= P && asks_.begin()->first <= P) {
             auto& bq = bids_.begin()->second;
             auto& aq = asks_.begin()->second;
@@ -142,6 +161,8 @@ private:
     }
 
     SymbolInfo info_;
+    CageConfig cage_;
+    Price last_;
     Phase phase_ = Phase::Closed;
     std::map<Price, std::deque<O>, std::greater<Price>> bids_;
     std::map<Price, std::deque<O>> asks_;

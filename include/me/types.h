@@ -30,7 +30,7 @@ inline bool is_auction(Phase p) { return p == Phase::OpeningAuction || p == Phas
 // Inbound message. Fixed-size POD so it can travel through lock-free rings
 // and be memory-mapped straight from a flow file.
 struct OrderMsg {
-    int64_t ts_ns = 0;   // gateway ingress timestamp (steady clock ns)
+    int64_t ts = 0;      // gateway ingress timestamp (TscClock ticks)
     OrderId id = 0;      // New: new order id; Cancel: id to cancel
     SymbolId sym = 0;
     Price price = 0;     // ticks; ignored for MarketBest5IOC
@@ -56,7 +56,21 @@ inline bool operator==(const Trade& a, const Trade& b) {
            a.qty == b.qty && a.bs_flag == b.bs_flag;
 }
 
-enum class RejectReason : uint8_t { BadQty, OutOfBand, UnknownOrder, MarketInAuction, Closed, DuplicateId };
+enum class RejectReason : uint8_t { BadQty, OutOfBand, UnknownOrder, MarketInAuction, Closed, DuplicateId, PriceCage };
+
+// 价格笼子 (main-board price cage), applied to limit orders in continuous
+// trading only:
+//   buy  price <= max(buy_base  * (100 + pct) / 100, buy_base  + min_ticks)
+//   sell price >= min(sell_base * (100 - pct) / 100, sell_base - min_ticks)
+// buy_base  = best ask, else best bid, else last trade, else previous close
+// sell_base = best bid, else best ask, else last trade, else previous close
+// Out-of-cage orders are rejected. (Some venues instead park them until the
+// cage moves; that variant is not implemented.)
+struct CageConfig {
+    bool enabled = true;
+    int pct = 2;         // 2%
+    int min_ticks = 10;  // 0.10 CNY floor for low-priced stocks
+};
 
 // Static per-symbol reference data.
 struct SymbolInfo {

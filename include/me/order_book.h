@@ -38,8 +38,10 @@ class OrderBook {
 public:
     static constexpr uint32_t NIL = 0xFFFFFFFFu;
 
-    explicit OrderBook(const SymbolInfo& info, size_t expected_orders = 4096)
+    explicit OrderBook(const SymbolInfo& info, size_t expected_orders = 4096, CageConfig cage = {})
         : info_(info),
+          cage_(cage),
+          last_px_(info.prev_close),
           lo_(info.lower_limit),
           nlevels_(info.upper_limit - info.lower_limit + 1),
           bids_(nlevels_),
@@ -58,6 +60,18 @@ public:
     bool has_ask() const { return best_ask_ >= 0; }
     Price best_bid() const { return lo_ + best_bid_; }
     Price best_ask() const { return lo_ + best_ask_; }
+    Price last_price() const { return last_px_; }
+
+    // Price-cage check for a limit order arriving in continuous trading.
+    bool within_cage(Side s, Price p) const {
+        if (!cage_.enabled) return true;
+        if (s == Side::Buy) {
+            Price base = has_ask() ? best_ask() : has_bid() ? best_bid() : last_px_;
+            return int64_t(p) * 100 <= int64_t(base) * (100 + cage_.pct) || p <= base + cage_.min_ticks;
+        }
+        Price base = has_bid() ? best_bid() : has_ask() ? best_ask() : last_px_;
+        return int64_t(p) * 100 >= int64_t(base) * (100 - cage_.pct) || p >= base - cage_.min_ticks;
+    }
 
     // Aggregated depth at a price (for snapshots / tests).
     int64_t level_qty(Side s, Price p) const {
@@ -155,6 +169,8 @@ private:
         if (!market && (m.price < info_.lower_limit || m.price > info_.upper_limit))
             return lis.on_reject(m.id, RejectReason::OutOfBand);
         if (index_.find(m.id)) return lis.on_reject(m.id, RejectReason::DuplicateId);
+        if (!market && phase_ == Phase::Continuous && !within_cage(m.side, m.price))
+            return lis.on_reject(m.id, RejectReason::PriceCage);
 
         Qty left = m.qty;
         if (phase_ == Phase::Continuous) {
@@ -192,6 +208,7 @@ private:
                 left -= q;
                 rn.qty -= q;
                 lv.total -= q;
+                last_px_ = px;
                 if (S == Side::Buy) lis.on_trade(Trade{m.id, rn.id, px, q, 'B', m.time});
                 else lis.on_trade(Trade{rn.id, m.id, px, q, 'S', m.time});
                 if (rn.qty == 0) unlink(ni, lv, S == Side::Buy ? Side::Sell : Side::Buy);
@@ -228,6 +245,7 @@ private:
     void uncross(uint32_t time, L& lis) {
         AuctionResult r = auction_price();
         if (!r.crossed) return;
+        last_px_ = r.price;
         const int p = r.price - lo_;
         // Price priority across levels, time priority (FIFO) within a level.
         while (best_bid_ >= p && best_ask_ >= 0 && best_ask_ <= p) {
@@ -301,6 +319,8 @@ private:
     }
 
     SymbolInfo info_;
+    CageConfig cage_;
+    Price last_px_;
     Price lo_;
     int nlevels_;
     std::vector<Level> bids_, asks_;

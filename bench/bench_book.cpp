@@ -45,14 +45,27 @@ int main(int argc, char** argv) {
         std::vector<OrderBook> books;
         for (auto& s : f.symbols) books.emplace_back(s, 1 << 14);
         Count c;
-        std::vector<int64_t> lat;
-        lat.reserve(f.msgs.size());
+        LatencyHistogram h;
         for (const OrderMsg& m : f.msgs) {
-            int64_t t0 = now_ns();
+            uint64_t t0 = TscClock::now();
             books[m.sym].process(m, c);
-            lat.push_back(now_ns() - t0);
+            h.record(TscClock::now() - t0);
         }
-        print_percentiles("core/msg", summarize(std::move(lat)));
+        print_percentiles("core/msg", h.summary(TscClock::ns_per_tick()));
+    }
+
+    // --- cost of the timestamp itself (what each probe adds to a measurement)
+    {
+        const int N = 5'000'000;
+        volatile uint64_t sink = 0;
+        int64_t t0 = now_ns();
+        for (int i = 0; i < N; ++i) sink = sink + uint64_t(now_ns());
+        double steady = double(now_ns() - t0) / N;
+        t0 = now_ns();
+        for (int i = 0; i < N; ++i) sink = sink + TscClock::now();
+        double tsc = double(now_ns() - t0) / N;
+        std::printf("timestamp cost: steady_clock %.1f ns, %s %.1f ns (%.3f ns/tick)\n", steady,
+                    TscClock::using_tsc() ? "rdtscp" : "fallback", tsc, TscClock::ns_per_tick());
     }
 
     // --- naive reference book

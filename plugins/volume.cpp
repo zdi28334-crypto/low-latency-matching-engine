@@ -9,16 +9,17 @@ static const char* name(int idx) { return names.v[idx].c_str(); }
 
 static int compute(int idx, const FactorInput* in, double* out) {
     const int w = kWindows[idx % kNumWindows];
+    const int64_t n = in->n;
     const double *c = in->close, *v = in->volume;
-    for (int64_t t = 0; t < in->n; ++t) {
-        if (t < w - 1) { out[t] = NaN; continue; }
-        if (idx < kNumWindows) {  // vol_ratio_w
-            out[t] = v[t] / window_mean(v, t, w);
-        } else {                  // vwap_dev_w
-            double pv = 0, vv = 0;
-            for (int64_t i = t - w + 1; i <= t; ++i) { pv += c[i] * v[i]; vv += v[i]; }
-            out[t] = vv > 0 ? c[t] / (pv / vv) - 1.0 : NaN;
-        }
+    if (idx < kNumWindows) {  // vol_ratio_w
+        rolling_sum(v, n, w, out);
+        for (int64_t t = w - 1; t < n; ++t) out[t] = v[t] / (out[t] / w);
+    } else {                  // vwap_dev_w
+        std::vector<double> pv(n), spv(n);
+        for (int64_t t = 0; t < n; ++t) pv[t] = c[t] * v[t];
+        rolling_sum(pv.data(), n, w, spv.data());
+        rolling_sum(v, n, w, out);
+        for (int64_t t = w - 1; t < n; ++t) out[t] = out[t] > 0 ? c[t] / (spv[t] / out[t]) - 1.0 : NaN;
     }
     return 0;
 }

@@ -35,7 +35,6 @@ int main(int argc, char** argv) {
     opt.shards = shards;
     opt.log_mode = log == "sync" ? LogMode::Sync : log == "none" ? LogMode::None : LogMode::Async;
     opt.log_path = "/tmp/me_bench_" + log + ".log";
-    opt.expected_msgs = f.msgs.size();
     if (pin && ncpu > 1) {
         for (int k = 0; k < shards; ++k) opt.shard_cpus.push_back(1 + k % (ncpu - 1));
         opt.logger_cpu = 0;
@@ -61,24 +60,25 @@ int main(int argc, char** argv) {
     eng.finish();
     const double secs = (now_ns() - t0) / 1e9;
 
-    std::vector<int64_t> qw, mc, pub, e2e;
+    LatencyHistogram qw, mc, pub, e2e;
     uint64_t trades = 0;
     for (int k = 0; k < eng.shards(); ++k) {
         const ShardStats& s = eng.stats(k);
-        qw.insert(qw.end(), s.queue_wait.begin(), s.queue_wait.end());
-        mc.insert(mc.end(), s.match_core.begin(), s.match_core.end());
-        pub.insert(pub.end(), s.publish.begin(), s.publish.end());
-        e2e.insert(e2e.end(), s.e2e.begin(), s.e2e.end());
+        qw.merge(s.queue_wait);
+        mc.merge(s.match_core);
+        pub.merge(s.publish);
+        e2e.merge(s.e2e);
         trades += s.trades;
         std::printf("  shard %d: %lu msgs, %lu trades\n", k, (unsigned long)s.msgs, (unsigned long)s.trades);
     }
     std::printf("shards=%d log=%s pin=%d rate=%s msgs=%zu trades=%lu  wall=%.3fs  throughput=%.0f msg/s\n", shards,
                 log.c_str(), int(pin), rate > 0 ? std::to_string((long)rate).c_str() : "max", f.msgs.size(),
                 (unsigned long)trades, secs, f.msgs.size() / secs);
-    print_percentiles("queue_wait", summarize(std::move(qw)));
-    print_percentiles("match_core", summarize(std::move(mc)));
-    print_percentiles("publish", summarize(std::move(pub)));
-    print_percentiles("e2e", summarize(std::move(e2e)));
+    const double k = TscClock::ns_per_tick();
+    print_percentiles("queue_wait", qw.summary(k));
+    print_percentiles("match_core", mc.summary(k));
+    print_percentiles("publish", pub.summary(k));
+    print_percentiles("e2e", e2e.summary(k));
     std::printf("  log records written=%lu dropped=%lu\n", (unsigned long)eng.log_written(),
                 (unsigned long)eng.log_dropped());
     return 0;

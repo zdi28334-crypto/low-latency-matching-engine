@@ -66,13 +66,7 @@ Engine::Engine(const std::vector<SymbolInfo>& symbols, EngineOptions opt) : opt_
         local_index_[s.id] = static_cast<int>(shards_[k]->books.size());
         shards_[k]->books.emplace_back(s, 1 << 14);
     }
-    if (opt_.record_latency && opt_.expected_msgs) {
-        for (auto& sh : shards_) {
-            size_t r = opt_.expected_msgs / opt_.shards * 2;
-            sh->st.queue_wait.reserve(r); sh->st.match_core.reserve(r);
-            sh->st.publish.reserve(r); sh->st.e2e.reserve(r);
-        }
-    }
+    (void)TscClock::now();  // calibrate before any thread starts
     if (opt_.log_mode == LogMode::Async) {
         logger_ = std::make_unique<AsyncLogger>(opt_.log_path, opt_.shards, 1 << 20);
     } else if (opt_.log_mode == LogMode::Sync) {
@@ -100,7 +94,7 @@ void Engine::start() {
 }
 
 void Engine::submit(OrderMsg m) {
-    m.ts_ns = now_ns();
+    m.ts = static_cast<int64_t>(TscClock::now());
     shards_[route_[m.sym]]->inbox.push(m);
 }
 
@@ -130,13 +124,13 @@ void Engine::run_shard(Shard& sh) {
         }
         idle = 0;
         if (m.sym == kStopSym) break;
-        const int64_t t_deq = lat ? now_ns() : 0;
+        const uint64_t t_deq = lat ? TscClock::now() : 0;
 
         buf.ev.clear();
         buf.sym = m.sym;
-        buf.ts = m.ts_ns;
+        buf.ts = m.ts;
         sh.books[local_index_[m.sym]].process(m, buf);
-        const int64_t t_match = lat ? now_ns() : 0;
+        const uint64_t t_match = lat ? TscClock::now() : 0;
 
         // ---- publish stage
         switch (opt_.log_mode) {
@@ -156,11 +150,13 @@ void Engine::run_shard(Shard& sh) {
         }
         ++sh.st.msgs;
         if (lat) {
-            const int64_t t_pub = now_ns();
-            sh.st.queue_wait.push_back(t_deq - m.ts_ns);
-            sh.st.match_core.push_back(t_match - t_deq);
-            sh.st.publish.push_back(t_pub - t_match);
-            sh.st.e2e.push_back(t_pub - m.ts_ns);
+            const uint64_t t_pub = TscClock::now();
+            const uint64_t t_in = static_cast<uint64_t>(m.ts);
+            // ingress is stamped on another core: clamp tiny cross-core skew
+            sh.st.queue_wait.record(t_deq > t_in ? t_deq - t_in : 0);
+            sh.st.match_core.record(t_match - t_deq);
+            sh.st.publish.record(t_pub - t_match);
+            sh.st.e2e.record(t_pub > t_in ? t_pub - t_in : 0);
         }
     }
 }

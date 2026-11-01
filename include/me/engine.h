@@ -27,6 +27,7 @@
 
 #include "me/async_logger.h"
 #include "me/consistent_hash.h"
+#include "me/latency.h"
 #include "me/order_book.h"
 #include "me/spsc_queue.h"
 #include "me/types.h"
@@ -41,7 +42,6 @@ struct EngineOptions {
     LogMode log_mode = LogMode::Async;
     std::string log_path = "engine.log";
     bool record_latency = true;
-    size_t expected_msgs = 0;  // pre-reserve latency buffers
     // CPU pinning (empty / -1 = let the OS schedule). Pinning keeps matching
     // threads from being preempted by the logger or migrated between cores,
     // which is what dominates tail latency on small machines.
@@ -52,10 +52,11 @@ struct EngineOptions {
 // Pin the calling thread to one CPU; returns false if not permitted.
 bool pin_current_thread(int cpu);
 
+// Latency histograms are in TscClock ticks; convert with TscClock::ns_per_tick().
 struct ShardStats {
     uint64_t msgs = 0, trades = 0, rests = 0, cancels = 0, rejects = 0;
     int64_t traded_qty = 0;
-    std::vector<int64_t> queue_wait, match_core, publish, e2e;
+    LatencyHistogram queue_wait, match_core, publish, e2e;
 };
 
 class Engine {
