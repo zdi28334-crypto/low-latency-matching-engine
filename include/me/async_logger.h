@@ -21,7 +21,7 @@ namespace me {
 struct LogRecord {
     int64_t ts;
     uint32_t sym;
-    char kind;     // T trade, A rest, D cancel, R reject
+    char kind;     // T trade, A rest, D cancel, X expired remainder, R reject
     char bs;
     uint16_t pad;
     uint64_t a, b; // ids
@@ -35,6 +35,7 @@ public:
     explicit MmapFile(const std::string& path, size_t chunk = 64ull << 20);
     ~MmapFile();
     void append(const char* data, size_t n);
+    void sync();  // msync(MS_SYNC): survive power loss, not just a process crash
     size_t size() const { return pos_; }
 private:
     void grow(size_t need);

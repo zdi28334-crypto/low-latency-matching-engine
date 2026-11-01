@@ -29,7 +29,7 @@ find_package(Threads REQUIRED)
 include_directories(${CMAKE_SOURCE_DIR}/include)
 
 # ---------------------------------------------------------------- engine lib
-add_library(me_core STATIC src/async_logger.cpp src/engine.cpp)
+add_library(me_core STATIC src/async_logger.cpp src/engine.cpp src/recovery.cpp)
 target_link_libraries(me_core PUBLIC Threads::Threads)
 
 # ---------------------------------------------------------------- tools
@@ -38,6 +38,8 @@ add_executable(exchange_sim tools/exchange_sim.cpp)
 add_executable(l2_rebuild tools/l2_rebuild.cpp)
 add_executable(replay_diff tools/replay_diff.cpp)
 add_executable(factor_runner tools/factor_runner.cpp)
+add_executable(crash_test tools/crash_test.cpp)
+target_link_libraries(crash_test PRIVATE me_core)
 add_executable(hiccup tools/hiccup.cpp)
 target_link_libraries(hiccup PRIVATE Threads::Threads)
 target_link_libraries(factor_runner PRIVATE ${CMAKE_DL_LIBS})
@@ -55,7 +57,7 @@ foreach(fam momentum volatility volume reversion)
 endforeach()
 
 # ---------------------------------------------------------------- tests
-add_executable(unit_tests tests/test_main.cpp tests/test_book.cpp tests/test_engine.cpp)
+add_executable(unit_tests tests/test_main.cpp tests/test_book.cpp tests/test_engine.cpp tests/test_recovery.cpp)
 target_link_libraries(unit_tests PRIVATE me_core)
 enable_testing()
 add_test(NAME unit_tests COMMAND unit_tests)

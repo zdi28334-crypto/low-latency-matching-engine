@@ -41,6 +41,10 @@ void MmapFile::append(const char* data, size_t n) {
     pos_ += n;
 }
 
+void MmapFile::sync() {
+    if (base_ && pos_ && ::msync(base_, pos_, MS_SYNC) != 0) std::perror("msync");
+}
+
 int format_record(const LogRecord& r, char* out) {
     return std::snprintf(out, 128, "%ld %u %c %c %lu %lu %d %d\n", (long)r.ts, r.sym, r.kind, r.bs ? r.bs : '-',
                          (unsigned long)r.a, (unsigned long)r.b, r.px, r.qty);
