@@ -31,6 +31,7 @@
 //   ord (SZSE 'O' rows): '2' limit, '1' best-5 IOC, 'T' best-5 to limit,
 //   'U' own best, 'C' counter best; '-' elsewhere.
 #pragma once
+#include <algorithm>
 #include <cstdio>
 #include <map>
 #include <stdexcept>
@@ -227,6 +228,35 @@ public:
     }
     const Stats& stats() const { return st_; }
 
+    // ---- order-by-order view (used by the backtest fill simulator)
+    // FIFO of order ids resting at one price level, oldest first.
+    const std::vector<OrderId>* queue(SymbolId sym, Side s, Price p) const {
+        auto it = books_.find(sym);
+        if (it == books_.end()) return nullptr;
+        const auto& q = s == Side::Buy ? it->second.qbids : it->second.qasks;
+        auto qi = q.find(p);
+        return qi == q.end() ? nullptr : &qi->second;
+    }
+    // All price levels of one side with their FIFO queues (ascending price).
+    const std::map<Price, std::vector<OrderId>>* queues(SymbolId sym, Side s) const {
+        auto it = books_.find(sym);
+        if (it == books_.end()) return nullptr;
+        return s == Side::Buy ? &it->second.qbids : &it->second.qasks;
+    }
+    // Remaining quantity of a resting order (0 if unknown / gone).
+    Qty order_qty(SymbolId sym, OrderId id) const {
+        auto it = books_.find(sym);
+        if (it == books_.end()) return 0;
+        auto oi = it->second.orders.find(id);
+        return oi == it->second.orders.end() || !oi->second.price ? 0 : oi->second.qty;
+    }
+    // SZSE: place pending best-5-to-limit remainders now (call at a message
+    // boundary, e.g. when the exchange timestamp advances).
+    void flush_pending() {
+        for (SymbolId s : pending_syms_) finalize(books_[s]);
+        pending_syms_.clear();
+    }
+
 private:
     struct Ord {
         Side side;
@@ -238,13 +268,18 @@ private:
     struct Book {
         std::unordered_map<OrderId, Ord> orders;
         std::map<Price, int64_t> bids, asks;
+        std::map<Price, std::vector<OrderId>> qbids, qasks;  // FIFO per level
         OrderId pending = 0;  // SZSE: market order whose events are still arriving
         std::map<Price, int64_t>& level(Side s) { return s == Side::Buy ? bids : asks; }
+        std::map<Price, std::vector<OrderId>>& queue(Side s) { return s == Side::Buy ? qbids : qasks; }
     };
 
     void add(Book& bk, OrderId id, const Ord& o) {
         bk.orders[id] = o;
-        if (o.price) bk.level(o.side)[o.price] += o.qty;
+        if (o.price) {
+            bk.level(o.side)[o.price] += o.qty;
+            bk.queue(o.side)[o.price].push_back(id);
+        }
     }
 
     // Removes q from an order (whole remainder if `whole`). False if unknown.
@@ -264,6 +299,13 @@ private:
         o.qty -= q;
         if (o.qty == 0) {
             if (bk.pending == id) bk.pending = 0;
+            if (o.price) {
+                auto& qm = bk.queue(o.side);
+                auto qi = qm.find(o.price);
+                auto& v = qi->second;
+                v.erase(std::find(v.begin(), v.end(), id));
+                if (v.empty()) qm.erase(qi);
+            }
             bk.orders.erase(it);
         }
         return true;
@@ -327,7 +369,7 @@ private:
                 OrderId id = s == Side::Buy ? r.buy_no : r.sell_no;
                 const bool offbook = r.ord == '1' || r.ord == 'T';
                 add(bk, id, Ord{s, offbook ? 0 : r.price, r.qty, r.ord});
-                if (offbook) bk.pending = id;
+                if (offbook) { bk.pending = id; pending_syms_.push_back(r.sym); }
                 break;
             }
             case 'T': {
@@ -348,6 +390,7 @@ private:
 
     Venue venue_;
     std::unordered_map<SymbolId, Book> books_;
+    std::vector<SymbolId> pending_syms_;
     Stats st_;
 };
 

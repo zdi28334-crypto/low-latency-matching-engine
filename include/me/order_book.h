@@ -117,6 +117,23 @@ public:
         for (int i = 0; i < nlevels_; ++i) if (asks_[i].count) visit(asks_[i], i);
     }
 
+    // Best price on side s among resting orders accepted by keep(id, account)
+    // (e.g. "every order except my own"). Walks from the best level and stops
+    // at the first accepted order.
+    template <class Keep>
+    bool best_where(Side s, Keep keep, Price& out) const {
+        const bool buy = s == Side::Buy;
+        int i = buy ? best_bid_ : best_ask_;
+        while (i >= 0) {
+            const Level& lv = buy ? bids_[i] : asks_[i];
+            for (uint32_t ni = lv.head; ni != NIL; ni = pool_[ni].next)
+                if (keep(pool_[ni].id, pool_[ni].account)) { out = lo_ + i; return true; }
+            if (buy) i = i > 0 ? highest_set_at_or_below(bid_bits_, i - 1) : -1;
+            else i = i + 1 < nlevels_ ? lowest_set_at_or_above(ask_bits_, i + 1) : -1;
+        }
+        return false;
+    }
+
     // Snapshot restore (crash recovery). Only valid on a freshly constructed book.
     void restore_state(Phase ph, Price last_px) { phase_ = ph; last_px_ = last_px; }
     void restore_order(const RestingOrder& o) { rest(o.id, o.side, o.price - lo_, o.qty, o.account); }
