@@ -25,6 +25,11 @@ echo "==> differential replay + golden round-trip"
 echo "==> crash recovery (SIGKILL at random moments)"
 "$B"/crash_test 4 20 400000 50000
 
+echo "==> backtest fill simulation vs ground truth"
+"$B"/backtest --symbols 10 --orders 200000 | sed -n '1,9p'
+"$B"/exchange_sim "$D"/day.flow "$D"/ticks_bt.csv "$D"/snap_bt.csv --venue sse
+"$B"/backtest --ticks "$D"/ticks_bt.csv --venue sse --base 2000 --commission-bps 1 --stamp-bps 5
+
 echo "==> Python -> C++ factor consistency"
 python3 python/gen_bars.py "$D"/bars.csv 10 800 3
 "$B"/factor_runner "$D"/bars.csv "$D"/fac "$B"/libfactor_{momentum,volatility,volume,reversion}.so

@@ -38,6 +38,11 @@ echo; echo "==> [5] replay + differential + golden regression"
 echo; echo "==> [5b] crash recovery: SIGKILL at random moments, recover, compare, resume"
 ./build/crash_test 10 50 2000000 100000
 
+echo; echo "==> [5c] backtest fill simulation: queue / touch / through models vs ground truth"
+./build/backtest --symbols 50 --orders 1000000 --interval-ms 20000 --ttl-ms 10000
+./build/backtest --symbols 50 --orders 1000000
+./build/backtest --symbols 50 --orders 1000000 --venue szse | sed -n '1,9p'
+
 echo; echo "==> [6] Python -> C++ factor plugins consistency"
 python3 python/gen_bars.py data/bars.csv 30 1500 1
 ./build/factor_runner data/bars.csv data/factors_cpp build/libfactor_{momentum,volatility,volume,reversion}.so
